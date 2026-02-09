@@ -89,9 +89,13 @@ class BaseScraper(ABC):
             pass
     
     def _save_downloaded_file(self, download, app_name: str, version: str) -> str:
-        """Save a Playwright download to disk with source-specific filename."""
+        """Save a Playwright download to disk in an app-specific subdirectory."""
+        # Create app-specific directory
+        app_dir = os.path.join(self.output_dir, app_name)
+        os.makedirs(app_dir, exist_ok=True)
+        
         filename = f"{app_name}-{version}-{self.SOURCE_NAME}.apk"
-        filepath = os.path.join(self.output_dir, filename)
+        filepath = os.path.join(app_dir, filename)
         download.save_as(filepath)
         return filepath
     
