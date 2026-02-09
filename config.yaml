@@ -1,0 +1,34 @@
+# APK Scraper Configuration
+# Define apps and versions to fetch
+
+output_dir: ./downloads
+headless: true
+
+apps:
+  telegram:
+    versions:
+      - "12.4.0"
+    sources:
+      apkmirror:
+        developer: telegram-fz-llc
+        app_name: telegram
+        variant_index: 0  # 0 = first variant (usually universal)
+      uptodown:
+        app_slug: telegram
+      apkpure:
+        package: org.telegram.messenger
+        app_slug: telegram
+
+  # Example: Add more apps here
+  # whatsapp:
+  #   versions:
+  #     - "2.24.1.0"
+  #   sources:
+  #     apkmirror:
+  #       developer: whatsapp-inc
+  #       app_name: whatsapp
+  #     uptodown:
+  #       app_slug: whatsapp
+  #     apkpure:
+  #       package: com.whatsapp
+  #       app_slug: whatsapp
