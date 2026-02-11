@@ -93,6 +93,11 @@ python main.py --app telegram --version 12.4.0
 python main.py --source apkmirror
 ```
 
+### Bulk fetch from a JSON list
+```bash
+python main.py --bulk versions.json
+```
+
 ### Debug Mode (See browser actions)
 ```bash
 python main.py --no-headless --debug
@@ -100,7 +105,7 @@ python main.py --no-headless --debug
 
 ## ⚠️ Limitations
 
-- **APKPure**: Currently heavily protected by Cloudflare "Just a moment" challenges. Headless scraping may fail frequently for this source in restricted environments.
+- **APKPure**: Highly protected by Cloudflare. A mobile domain fallback (`m.apkpure.com`) is implemented which can often load versions, but the download flow itself remains heavily restricted in headless environments. Works best with APKMirror or Uptodown.
 - **Dynamic Selectors**: While robust, these scrapers rely on the HTML structure of the target websites. If they change their UI, the scrapers may need updates.
 
 ## 📄 License

@@ -13,7 +13,7 @@ class APKPureScraper(BaseScraper):
     """Scraper for APKPure.net using Playwright."""
     
     SOURCE_NAME = "apkpure"
-    BASE_URL = "https://apkpure.net"
+    BASE_URL = "https://m.apkpure.com"
     
     def scrape(self, config: dict, version: str) -> Optional[APKInfo]:
         """
@@ -50,29 +50,35 @@ class APKPureScraper(BaseScraper):
             
             # Look for version in the list
             self.logger.info("Searching for version in the list...")
-            version_items = page.query_selector_all("a.ver-item, a.version-item, li.ver a")
+            # Mobile site uses different selectors
+            version_items = page.query_selector_all("a.ver-item, a.version-item, li.ver a, .ver-list a")
             self.logger.debug(f"Found {len(version_items)} version items")
             
-            if not version_items:
-                if "cloudflare" in content.lower() or "verify you are human" in content.lower():
-                    self.logger.error("Blocked by Cloudflare on APKPure")
-                else:
-                    self.logger.debug(f"First 500 chars of page: {content[:500]}")
             for item in version_items:
-                text = item.inner_text()
-                if version in text:
-                    version_link = item.get_attribute("href")
+                text = item.inner_text().lower()
+                href = item.get_attribute("href") or ""
+                if version in text or f"/{version.replace('.', '-')}" in href:
+                    version_link = href
+                    self.logger.info(f"Matched version {version} in list")
                     break
             
             # Fallback: search all links for version
             if not version_link:
-                all_links = page.query_selector_all("a[href*='download']")
+                self.logger.debug("Trying fallback link search...")
+                all_links = page.query_selector_all("a")
                 for link in all_links:
-                    text = link.inner_text()
+                    text = link.inner_text().lower()
                     href = link.get_attribute("href") or ""
-                    if version in text or version.replace(".", "-") in href:
+                    # Match version number in text or href, but skip generic download links
+                    if (version in text or version.replace(".", "-") in href) and "download" in href:
                         version_link = href
+                        self.logger.info(f"Matched version {version} via fallback link")
                         break
+            
+            if not version_link:
+                if "cloudflare" in content.lower() or "verify you are human" in content.lower():
+                    self.logger.error("Blocked by Cloudflare on APKPure")
+                raise VersionNotFoundError(f"Version {version} not found on APKPure")
             
             if not version_link:
                 raise VersionNotFoundError(f"Version {version} not found on APKPure")
