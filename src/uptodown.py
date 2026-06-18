@@ -2,21 +2,65 @@
 """Uptodown scraper using Playwright browser automation."""
 
 import os
-import re
 from typing import Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from .base import BaseScraper, APKInfo, VersionNotFoundError, DownloadError
+from .base import (
+    BaseScraper,
+    APKInfo,
+    VersionNotFoundError,
+    DownloadError,
+    detect_architectures,
+)
 
 
 class UptodownScraper(BaseScraper):
     """Scraper for Uptodown.com using Playwright."""
     
     SOURCE_NAME = "uptodown"
+    DOWNLOAD_BUTTON_SELECTOR = (
+        "button#detail-download-button, "
+        "a.button.download.green, "
+        "a[href*='/android/download/']"
+    )
     
     def _get_versions_url(self, app_slug: str) -> str:
         return f"https://{app_slug}.en.uptodown.com/android/versions"
+
+    def _find_download_button(self, page, timeout: int = 20000):
+        """Find the current Uptodown download trigger."""
+        return page.wait_for_selector(self.DOWNLOAD_BUTTON_SELECTOR,
+                                      timeout=timeout)
+
+    def _start_download(self, page):
+        """Click Uptodown's download trigger with a re-querying retry."""
+        for attempt in range(2):
+            download_btn = self._find_download_button(page)
+            if not download_btn:
+                raise DownloadError(
+                    "Could not find the main Download button on the "
+                    "version page"
+                )
+
+            timeout = 25000 if attempt == 0 else 60000
+            try:
+                with page.expect_download(timeout=timeout) as download_info:
+                    download_btn.click(force=True, delay=500)
+                return download_info.value
+            except PlaywrightTimeout:
+                self.logger.warning(
+                    "Download was not emitted after click; re-querying the "
+                    "button and trying again"
+                )
+                self.logger.debug(
+                    f"After missed click: url={page.url!r}, title={page.title()!r}"
+                )
+                if attempt == 1:
+                    raise
+                self._wait(2)
+
+        raise DownloadError("Uptodown download did not start")
     
     def scrape(self, config: dict, version: str) -> Optional[APKInfo]:
         """
@@ -102,43 +146,35 @@ class UptodownScraper(BaseScraper):
             # Step 5: Find and click the large "Download" button on the version page
             self.logger.info("Looking for the main download button...")
             try:
-                download_btn = page.wait_for_selector("button#detail-download-button, a.button.download.green", timeout=20000)
+                self._find_download_button(page)
             except Exception as e:
                 self.logger.error(f"Download button not found on Uptodown. Page title: {page.title()}")
                 # Log snippet
                 content = page.content()
                 self.logger.debug(f"First 500 chars of page: {content[:500]}")
                 raise DownloadError(f"Could not find the main Download button: {e}")
-            
-            if not download_btn:
-                raise DownloadError("Could not find the main Download button on the version page")
 
             self.logger.info("Clicking the Download button...")
+            download = self._start_download(page)
             
-            # Use a more reliable way to wait for download
-            # Some buttons on Uptodown don't trigger download on first click due to ads/popups
-            try:
-                with page.expect_download(timeout=60000) as download_info:
-                    # Click multiple times or use force if needed
-                    download_btn.click(force=True, delay=500)
-                download = download_info.value
-            except PlaywrightTimeout:
-                self.logger.warning("First click didn't trigger download, trying one more time...")
-                # Try to click by coordinates as a last resort or just click again
-                with page.expect_download(timeout=60000) as download_info:
-                    download_btn.click(force=True)
-                download = download_info.value
-            
-            filepath = self._save_downloaded_file(download, app_slug, version)
+            filepath, package_type = self._save_downloaded_file(
+                download,
+                app_slug,
+                version,
+            )
             file_size = os.path.getsize(filepath)
-            self.logger.info(f"Downloaded: {filepath} ({file_size:,} bytes)")
+            self.logger.info(
+                f"Downloaded: {filepath} ({package_type}, {file_size:,} bytes)"
+            )
             
             return APKInfo(
                 filepath=filepath,
                 version=version,
                 source=self.SOURCE_NAME,
                 size_bytes=file_size,
-                app_name=app_slug
+                app_name=app_slug,
+                package_type=package_type,
+                architectures=detect_architectures(filepath),
             )
             
         except PlaywrightTimeout as e:

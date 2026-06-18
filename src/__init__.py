@@ -7,7 +7,10 @@ from .base import (
     VersionNotFoundError,
     DownloadError,
     RateLimitError,
+    PACKAGE_FILE_EXTENSIONS,
     setup_logging,
+    detect_architectures,
+    classify_package_zip,
 )
 from .apkmirror import APKMirrorScraper
 from .uptodown import UptodownScraper
@@ -21,12 +24,15 @@ __all__ = [
     "VersionNotFoundError", 
     "DownloadError",
     "RateLimitError",
+    "PACKAGE_FILE_EXTENSIONS",
     "APKMirrorScraper",
     "UptodownScraper",
     "APKPureScraper",
     "load_config",
     "AppConfig",
     "setup_logging",
+    "detect_architectures",
+    "classify_package_zip",
 ]
 
 # Source priority order for fallback

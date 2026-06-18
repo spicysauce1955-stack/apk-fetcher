@@ -6,7 +6,13 @@ from typing import Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from .base import BaseScraper, APKInfo, VersionNotFoundError, DownloadError
+from .base import (
+    BaseScraper,
+    APKInfo,
+    VersionNotFoundError,
+    DownloadError,
+    detect_architectures,
+)
 
 
 class APKPureScraper(BaseScraper):
@@ -14,6 +20,91 @@ class APKPureScraper(BaseScraper):
     
     SOURCE_NAME = "apkpure"
     BASE_URL = "https://m.apkpure.com"
+
+    def _find_version_link(self, page, version: str) -> Optional[str]:
+        """Find a version-specific APKPure link from all anchors."""
+        version_slug = version.replace(".", "-")
+        candidates = []
+
+        for link in page.query_selector_all("a"):
+            text = link.inner_text().strip()
+            href = link.get_attribute("href") or ""
+            if not href or href == "#" or href.lower().startswith("javascript:"):
+                continue
+
+            text_lower = text.lower()
+            href_lower = href.lower()
+            has_version = (
+                version in text_lower
+                or version in href_lower
+                or version_slug in text_lower
+                or version_slug in href_lower
+            )
+            if not has_version:
+                continue
+
+            score = 0
+            if "download" in href_lower:
+                score += 4
+            if "/versions" in href_lower:
+                score += 2
+            if version in text_lower:
+                score += 2
+            if version_slug in href_lower:
+                score += 1
+            if "variant" in href_lower:
+                score -= 1
+
+            candidates.append((score, href, text))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, href, text = candidates[0]
+        self.logger.debug(
+            f"Matched APKPure version link score={score}, href={href!r}, "
+            f"text={text[:80]!r}"
+        )
+        return href
+
+    def _find_package_download_link(self, page, package: str) -> Optional[str]:
+        """Find the direct APK/XAPK download URL for the requested package."""
+        package_lower = package.lower()
+        candidates = []
+
+        for link in page.query_selector_all("a"):
+            href = link.get_attribute("href") or ""
+            href_lower = href.lower()
+            if package_lower not in href_lower:
+                continue
+            if "d.apkpure.com/b/" not in href_lower:
+                continue
+
+            text = link.inner_text().strip()
+            text_lower = text.lower()
+            score = 0
+            if "/b/apk/" in href_lower:
+                score += 4
+            if "/b/xapk/" in href_lower:
+                score += 3
+            if "download apk" in text_lower:
+                score += 3
+            if "download" in text_lower:
+                score += 1
+
+            candidates.append((score, link, href, text))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, _link, href, text = candidates[0]
+        self.logger.debug(
+            f"Matched APKPure package download score={score}, href={href!r}, "
+            f"text={text[:80]!r}"
+        )
+        return href
     
     def scrape(self, config: dict, version: str) -> Optional[APKInfo]:
         """
@@ -46,44 +137,15 @@ class APKPureScraper(BaseScraper):
             content = page.content()
             
             # Step 2: Find the target version
-            version_link = None
-            
-            # Look for version in the list
-            self.logger.info("Searching for version in the list...")
-            # Mobile site uses different selectors
-            version_items = page.query_selector_all("a.ver-item, a.version-item, li.ver a, .ver-list a")
-            self.logger.debug(f"Found {len(version_items)} version items")
-            
-            for item in version_items:
-                text = item.inner_text().lower()
-                href = item.get_attribute("href") or ""
-                if version in text or f"/{version.replace('.', '-')}" in href:
-                    version_link = href
-                    self.logger.info(f"Matched version {version} in list")
-                    break
-            
-            # Fallback: search all links for version
-            if not version_link:
-                self.logger.debug("Trying fallback link search...")
-                all_links = page.query_selector_all("a")
-                for link in all_links:
-                    text = link.inner_text().lower()
-                    href = link.get_attribute("href") or ""
-                    # Match version number in text or href, but skip generic download links
-                    if (version in text or version.replace(".", "-") in href) and "download" in href:
-                        version_link = href
-                        self.logger.info(f"Matched version {version} via fallback link")
-                        break
+            self.logger.info("Searching for version links...")
+            version_link = self._find_version_link(page, version)
             
             if not version_link:
                 if "cloudflare" in content.lower() or "verify you are human" in content.lower():
                     self.logger.error("Blocked by Cloudflare on APKPure")
                 raise VersionNotFoundError(f"Version {version} not found on APKPure")
-            
-            if not version_link:
-                raise VersionNotFoundError(f"Version {version} not found on APKPure")
-            
-            self.logger.info(f"Found version link")
+
+            self.logger.info("Found version link")
             
             # Step 3: Navigate to download page
             if not version_link.startswith("http"):
@@ -92,35 +154,41 @@ class APKPureScraper(BaseScraper):
             page.goto(version_link, wait_until="domcontentloaded", timeout=30000)
             self._wait(2)
             
-            # Step 4: Find and click download button
-            download_btn = page.query_selector("a.download-btn, a[href*='APK/download']")
+            # Step 4: Find the direct package download URL
+            download_url = self._find_package_download_link(page, package)
             
-            if not download_btn:
-                # Try more generic selectors
-                download_btn = page.query_selector("a.download-btn, a[href*='download'], button.download")
-            
-            if not download_btn:
-                raise DownloadError("Download button not found on APKPure version page")
+            if not download_url:
+                raise DownloadError(
+                    "Direct package download link not found on APKPure "
+                    "version page"
+                )
             
             # Step 5: Download
             self.logger.info("Starting download...")
-            
-            with page.expect_download(timeout=180000) as download_info:
-                download_btn.click()
-            
-            download = download_info.value
             app_name = app_slug.split("/")[-1] if "/" in app_slug else app_slug
-            filepath = self._save_downloaded_file(download, app_name, version)
+            try:
+                filepath, package_type = self._save_url_file(
+                    download_url,
+                    app_name,
+                    version,
+                    referer=page.url,
+                )
+            except Exception as e:
+                raise DownloadError(f"Direct package download failed: {e}") from e
             file_size = os.path.getsize(filepath)
             
-            self.logger.info(f"Downloaded: {filepath} ({file_size:,} bytes)")
+            self.logger.info(
+                f"Downloaded: {filepath} ({package_type}, {file_size:,} bytes)"
+            )
             
             return APKInfo(
                 filepath=filepath,
                 version=version,
                 source=self.SOURCE_NAME,
                 size_bytes=file_size,
-                app_name=app_name
+                app_name=app_name,
+                package_type=package_type,
+                architectures=detect_architectures(filepath),
             )
             
         except PlaywrightTimeout as e:
