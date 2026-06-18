@@ -6,7 +6,13 @@ from typing import Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from .base import BaseScraper, APKInfo, VersionNotFoundError, DownloadError
+from .base import (
+    BaseScraper,
+    APKInfo,
+    VersionNotFoundError,
+    DownloadError,
+    detect_architectures,
+)
 
 
 class APKMirrorScraper(BaseScraper):
@@ -92,17 +98,25 @@ class APKMirrorScraper(BaseScraper):
                 download_link.click()
             
             download = download_info.value
-            filepath = self._save_downloaded_file(download, app_name, version)
+            filepath, package_type = self._save_downloaded_file(
+                download,
+                app_name,
+                version,
+            )
             file_size = os.path.getsize(filepath)
             
-            self.logger.info(f"Downloaded: {filepath} ({file_size:,} bytes)")
+            self.logger.info(
+                f"Downloaded: {filepath} ({package_type}, {file_size:,} bytes)"
+            )
             
             return APKInfo(
                 filepath=filepath,
                 version=version,
                 source=self.SOURCE_NAME,
                 size_bytes=file_size,
-                app_name=app_name
+                app_name=app_name,
+                package_type=package_type,
+                architectures=detect_architectures(filepath),
             )
             
         except PlaywrightTimeout as e:
