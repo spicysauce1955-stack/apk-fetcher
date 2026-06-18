@@ -26,6 +26,8 @@ from src import (
     ScraperError,
     VersionNotFoundError,
     DownloadError,
+    PACKAGE_FILE_EXTENSIONS,
+    detect_architectures,
 )
 
 # Source priority and registry
@@ -37,62 +39,102 @@ SCRAPERS = {
     "apkpure": APKPureScraper,
 }
 
+SAVED_FILE_EXTENSIONS = PACKAGE_FILE_EXTENSIONS + (".download",)
 
-def is_already_downloaded(output_dir: str, app_name: str, version: str) -> Optional[str]:
-    """Check if any variant of this version is already downloaded."""
+
+def _format_abis(abis) -> str:
+    """Render an ABI list for logging."""
+    return ", ".join(abis) if abis else "unknown"
+
+
+def is_already_downloaded(output_dir: str, app_name: str, version: str,
+                          source: Optional[str] = None) -> Optional[str]:
+    """Check if a variant of this version is already downloaded.
+
+    If source is given, only files for that source count as a hit.
+    """
     app_dir = os.path.join(output_dir, app_name)
     if not os.path.isdir(app_dir):
         return None
-        
-    pattern = f"{app_name}-{version}-"
+
+    pattern = f"{app_name}-{version}-{source}" if source else f"{app_name}-{version}-"
     for filename in os.listdir(app_dir):
-        if filename.startswith(pattern) and filename.endswith(".apk"):
+        if filename.startswith(pattern) and filename.endswith(SAVED_FILE_EXTENSIONS):
             return os.path.join(app_dir, filename)
     return None
 
 
-def fetch_apk(app_config, version: str, output_dir: str, headless: bool, 
-              source_filter: str = None, force: bool = False) -> bool:
+def fetch_apk(app_config, version: str, output_dir: str, headless: bool,
+              source_filter: str = None, force: bool = False,
+              all_sources: bool = False) -> bool:
     """
-    Fetch a single APK version with fallback through sources.
-    
-    Returns True if download succeeded, False otherwise.
+    Fetch a single APK version.
+
+    Default mode: try sources in priority order, stop on first success (fallback).
+    all_sources mode: attempt every configured source, collecting one package
+    per source.
+
+    Returns True if at least one source succeeded, False otherwise.
     """
     logger = logging.getLogger("fetcher")
-    
-    # Check if already exists
-    if not force:
+
+    # Fast-skip in fallback mode if any variant already exists
+    if not force and not all_sources:
         existing_path = is_already_downloaded(output_dir, app_config.name, version)
         if existing_path:
             logger.info(f"⏭️  Skipping {app_config.name} v{version} - Already exists: {existing_path}")
-            return True # Consider existing as a 'success' in terms of workflow
-            
+            return True
+
     # Determine which sources to try
-    sources_to_try = [source_filter] if source_filter else SOURCE_PRIORITY
-    
+    if source_filter:
+        sources_to_try = [source_filter]
+    else:
+        sources_to_try = SOURCE_PRIORITY
+
+    any_success = False
+
     for source_name in sources_to_try:
         source_config = app_config.get_source_config(source_name)
-        
+
         if not source_config:
             logger.debug(f"No config for {source_name}, skipping")
             continue
-        
+
         scraper_class = SCRAPERS.get(source_name)
         if not scraper_class:
             logger.warning(f"Unknown source: {source_name}")
             continue
-        
+
+        # In all-sources mode, do a per-source skip check
+        if all_sources and not force:
+            existing = is_already_downloaded(output_dir, app_config.name, version, source_name)
+            if existing:
+                logger.info(
+                    f"⏭️  {app_config.name} v{version} from {source_name} "
+                    f"already exists: {existing} | "
+                    f"Arch: {_format_abis(detect_architectures(existing))}"
+                )
+                any_success = True
+                continue
+
         logger.info(f"Trying {source_name} for {app_config.name} v{version}...")
-        
+
         try:
             scraper = scraper_class(output_dir=output_dir, headless=headless)
             result = scraper.scrape(source_config, version)
-            
+
             if result:
                 logger.info(f"✅ Success! Downloaded: {result.filepath}")
-                logger.info(f"   Source: {result.source} | Size: {result.size_bytes:,} bytes")
-                return True
-                
+                logger.info(
+                    f"   Source: {result.source} | Type: {result.package_type} | "
+                    f"Size: {result.size_bytes:,} bytes | "
+                    f"Arch: {_format_abis(result.architectures)}"
+                )
+                any_success = True
+                if not all_sources:
+                    return True
+                continue
+
         except VersionNotFoundError as e:
             logger.warning(f"⚠️  Version not found on {source_name}: {e}")
             continue
@@ -105,12 +147,15 @@ def fetch_apk(app_config, version: str, output_dir: str, headless: bool,
         except Exception as e:
             logger.error(f"🔥 Unexpected error on {source_name}: {e}")
             continue
-    
-    logger.error(f"❌ Failed to download {app_config.name} v{version} from any source")
-    return False
+
+    if not any_success:
+        logger.error(f"❌ Failed to download {app_config.name} v{version} from any source")
+    return any_success
 
 
-def process_bulk(versions_file: str, apps_to_fetch: Dict, output_dir: str, headless: bool, source_filter: str, force: bool = False) -> bool:
+def process_bulk(versions_file: str, apps_to_fetch: Dict, output_dir: str,
+                 headless: bool, source_filter: str, force: bool = False,
+                 all_sources: bool = False) -> bool:
     """Process a bulk download from a JSON file."""
     logger = logging.getLogger("bulk")
     
@@ -134,7 +179,7 @@ def process_bulk(versions_file: str, apps_to_fetch: Dict, output_dir: str, headl
             if not version:
                 continue
                 
-            if not force:
+            if not force and not all_sources:
                 existing_path = is_already_downloaded(output_dir, app_name, version)
                 if existing_path:
                     logger.info(f"⏭️  v{version} already downloaded. Skipping.")
@@ -144,8 +189,9 @@ def process_bulk(versions_file: str, apps_to_fetch: Dict, output_dir: str, headl
             logger.info(f"\n{'='*60}")
             logger.info(f"Target: {app_name} v{version}")
             logger.info(f"{'='*60}")
-            
-            if fetch_apk(app_config, version, output_dir, headless, source_filter, force):
+
+            if fetch_apk(app_config, version, output_dir, headless,
+                         source_filter, force, all_sources):
                 success_count += 1
             else:
                 fail_count += 1
@@ -178,6 +224,10 @@ def main():
                             help="Path to config file (default: config.yaml)")
     exec_group.add_argument("--source", "-s", choices=list(SCRAPERS.keys()),
                             help="Use only this source (default: try all with fallback)")
+    exec_group.add_argument("--all-sources", action="store_true",
+                            help="Download from every configured source instead of "
+                                 "stopping at the first success "
+                                 "(one package per source)")
     exec_group.add_argument("--output", "-o",
                             help="Output directory (default: from config)")
     exec_group.add_argument("--force", "-f", action="store_true",
@@ -188,7 +238,10 @@ def main():
                             help="Enable debug logging")
     
     args = parser.parse_args()
-    
+
+    if args.all_sources and args.source:
+        parser.error("--all-sources cannot be combined with --source")
+
     # Setup logging
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
     logger = logging.getLogger("main")
@@ -215,7 +268,8 @@ def main():
 
     # Handle Bulk Mode
     if args.bulk:
-        success = process_bulk(args.bulk, apps_to_fetch, output_dir, headless, args.source, args.force)
+        success = process_bulk(args.bulk, apps_to_fetch, output_dir, headless,
+                               args.source, args.force, args.all_sources)
         sys.exit(0 if success else 1)
         
     # Handle Standard Mode
@@ -232,7 +286,7 @@ def main():
             continue
             
         for version in versions:
-            if not args.force:
+            if not args.force and not args.all_sources:
                 existing_path = is_already_downloaded(output_dir, app_name, version)
                 if existing_path:
                     logger.info(f"⏭️  {app_name} v{version} already downloaded. Skipping.")
@@ -242,8 +296,9 @@ def main():
             logger.info(f"\n{'='*60}")
             logger.info(f"Task: {app_name} v{version}")
             logger.info(f"{'='*60}")
-            
-            if fetch_apk(app_config, version, output_dir, headless, args.source, args.force):
+
+            if fetch_apk(app_config, version, output_dir, headless,
+                         args.source, args.force, args.all_sources):
                 success_count += 1
             else:
                 fail_count += 1
