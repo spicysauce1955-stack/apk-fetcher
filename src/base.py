@@ -89,14 +89,17 @@ def _abis_from_names(names) -> set:
             if idx + 1 < len(parts) and parts[idx + 1] in KNOWN_ABIS:
                 found.add(parts[idx + 1])
         # config.<abi>.apk / split_config.<abi>.apk
-        if lower.endswith(".apk") and "config." in lower:
+        if lower.endswith(".apk"):
             stem = os.path.basename(lower)[: -len(".apk")]
-            slug = stem.split("config.", 1)[1]
-            # Some ABIs use underscores (x86_64); others use dashes (armeabi-v7a).
-            # Check the raw slug first, then the dash-normalised form.
-            abi = slug if slug in KNOWN_ABIS else slug.replace("_", "-")
-            if abi in KNOWN_ABIS:
-                found.add(abi)
+            # Guard against names like "config.apk" where "config." only appears
+            # because the stem abuts the extension; the slug lives in the stem.
+            if "config." in stem:
+                slug = stem.split("config.", 1)[1]
+                # Some ABIs use underscores (x86_64); others use dashes
+                # (armeabi-v7a). Check the raw slug first, then the dash form.
+                abi = slug if slug in KNOWN_ABIS else slug.replace("_", "-")
+                if abi in KNOWN_ABIS:
+                    found.add(abi)
     return found
 
 

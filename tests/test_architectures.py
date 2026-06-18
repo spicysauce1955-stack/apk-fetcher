@@ -92,6 +92,18 @@ class TestDetectArchitectures(unittest.TestCase):
         path = self.track(_zip(["AndroidManifest.xml", "classes.dex"]))
         self.assertEqual(detect_architectures(path), ["universal"])
 
+    def test_config_named_apk_does_not_crash(self):
+        # Regression: entries like "config.apk"/"xconfig.apk" match "config."
+        # only via the extension boundary and must not raise IndexError.
+        path = self.track(_zip([
+            "manifest.json",
+            "base.apk",
+            "config.apk",
+            "xconfig.apk",
+            "feature.config.apk",
+        ]))
+        self.assertEqual(detect_architectures(path), ["universal"])
+
     def test_non_zip_returns_empty(self):
         fd, path = tempfile.mkstemp(suffix=".download")
         os.write(fd, b"not a zip")
