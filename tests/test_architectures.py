@@ -69,6 +69,21 @@ class TestDetectArchitectures(unittest.TestCase):
         ))
         self.assertEqual(detect_architectures(path), ["armeabi-v7a"])
 
+    def test_split_config_underscore_and_hyphen_names(self):
+        # Locks the slug logic: x86_64 keeps its underscore, arm64_v8a/armeabi_v7a
+        # normalize to hyphens. Uses the split_config.<abi>.apk prefix form.
+        path = self.track(_zip([
+            "manifest.json",
+            "base.apk",
+            "split_config.x86_64.apk",
+            "split_config.arm64_v8a.apk",
+            "split_config.armeabi_v7a.apk",
+        ]))
+        self.assertEqual(
+            detect_architectures(path),
+            ["arm64-v8a", "armeabi-v7a", "x86_64"],
+        )
+
     def test_aab_base_lib(self):
         path = self.track(_zip(["BundleConfig.pb", "base/lib/x86/libfoo.so"]))
         self.assertEqual(detect_architectures(path), ["x86"])
