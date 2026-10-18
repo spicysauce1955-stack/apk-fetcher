@@ -12,7 +12,6 @@ apps:
       apkmirror:
         developer: telegram-fz-llc
         app_name: telegram
-        variant_index: 0  # 0 = first variant (usually universal)
       uptodown:
         app_slug: telegram
       apkpure:

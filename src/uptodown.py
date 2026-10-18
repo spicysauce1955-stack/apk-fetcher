@@ -1,18 +1,44 @@
 #!/usr/bin/env python3
 """Uptodown scraper using Playwright browser automation."""
 
-import os
-from typing import Optional
+from typing import List
 
+from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from .base import (
     BaseScraper,
     APKInfo,
+    VariantRef,
     VersionNotFoundError,
     DownloadError,
-    detect_architectures,
 )
+
+
+def parse_uptodown_variants(html: str, app_slug: str,
+                            version: str) -> List[VariantRef]:
+    """Parse the versions list; each row matching version is one variant.
+
+    Uptodown lists a version once per variant, and the rows differ only by
+    data-version-id, which also addresses the variant's download page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    variants = []
+
+    for row in soup.select("[data-version-id]"):
+        version_el = row.select_one(".version")
+        if not version_el or version_el.get_text(strip=True) != version:
+            continue
+
+        version_id = row["data-version-id"].strip()
+        type_el = row.select_one(".type")
+        variants.append(VariantRef(
+            variant_id=version_id,
+            url=f"https://{app_slug}.en.uptodown.com/android/download/{version_id}",
+            label=type_el.get_text(strip=True) if type_el else "",
+        ))
+
+    return variants
 
 
 class UptodownScraper(BaseScraper):
@@ -62,123 +88,58 @@ class UptodownScraper(BaseScraper):
 
         raise DownloadError("Uptodown download did not start")
     
-    def scrape(self, config: dict, version: str) -> Optional[APKInfo]:
+    def _app_name(self, config: dict) -> str:
+        app_slug = config.get("app_slug")
+        if not app_slug:
+            raise ValueError("Uptodown config requires 'app_slug'")
+        return app_slug
+
+    def _list_variants(self, page, config: dict,
+                       version: str) -> List[VariantRef]:
         """
-        Download APK from Uptodown.
+        List every Uptodown row for the requested version.
         
         Config requires:
             - app_slug: App slug for URL (e.g., "telegram")
         """
-        app_slug = config.get("app_slug")
-        
-        if not app_slug:
-            raise ValueError("Uptodown config requires 'app_slug'")
-        
+        app_slug = config["app_slug"]
         versions_url = self._get_versions_url(app_slug)
         self.logger.info(f"Fetching {app_slug} v{version} from Uptodown")
         
-        playwright, browser, page = self._get_browser()
+        self.logger.info(f"Loading versions page: {versions_url}")
+        page.goto(versions_url, wait_until="domcontentloaded", timeout=30000)
+        self._wait(5) # Give more time for Cloudflare/scripts
         
+        self.logger.debug(f"Page title: {page.title()}")
+        
+        variants = parse_uptodown_variants(page.content(), app_slug, version)
+        if not variants:
+            raise VersionNotFoundError(f"Could not find version {version} for {app_slug} on Uptodown")
+        return variants
+
+    def _download_variant(self, page, app_name: str, version: str,
+                          variant: VariantRef) -> APKInfo:
+        self.logger.info(f"Navigating to variant page: {variant.url}")
+        page.goto(variant.url, wait_until="domcontentloaded", timeout=45000)
+        self._wait(5)
+        
+        # Find and click the large "Download" button on the version page
+        self.logger.info("Looking for the main download button...")
         try:
-            # Step 1: Load versions page
-            self.logger.info(f"Loading versions page: {versions_url}")
-            page.goto(versions_url, wait_until="domcontentloaded", timeout=30000)
-            self._wait(5) # Give more time for Cloudflare/scripts
-            
-            self.logger.debug(f"Page title: {page.title()}")
-            
-            # Step 2: Find the target version
-            version_link = None
-            
-            # Look for version in the list
-            self.logger.info("Searching for version in the list...")
-            # Uptodown uses data-url on div or a tags in the version list
-            version_items = page.query_selector_all("div[data-url], a[data-url]")
-            self.logger.debug(f"Found {len(version_items)} version items")
-            
-            if not version_items:
-                # Fallback to broad selectors if specific ones fail
-                version_items = page.query_selector_all(".version, .item, a")
-                self.logger.debug(f"Fallback: found {len(version_items)} items")
+            self._find_download_button(page)
+        except Exception as e:
+            self.logger.error(f"Download button not found on Uptodown. Page title: {page.title()}")
+            # Log snippet
+            content = page.content()
+            self.logger.debug(f"First 500 chars of page: {content[:500]}")
+            raise DownloadError(f"Could not find the main Download button: {e}")
 
-            for item in version_items:
-                text = item.inner_text().lower()
-                data_url = item.get_attribute("data-url") or ""
-                href = item.get_attribute("href") or ""
-                version_id = item.get_attribute("data-version-id")
-                
-                # Check for version in text or attributes
-                if version in text or (version_id and version in text):
-                    if version_id:
-                        # Construct the specific download page URL
-                        version_link = f"https://{app_slug}.en.uptodown.com/android/download/{version_id}"
-                        self.logger.info(f"Matched version {version} via ID: {version_id}")
-                        break
-                    
-                    # Fallback to data-url or href if ID not found
-                    if version in text or version in data_url or version in href:
-                        potential_link = data_url or href
-                        if potential_link and "/android/versions" not in potential_link and potential_link != f"https://{app_slug}.en.uptodown.com/android":
-                            version_link = potential_link
-                            self.logger.info(f"Matched version {version} in text/link")
-                            break
-            
-            if not version_link:
-                # Final fallback: search specifically for the version
-                self.logger.info("Trying fallback specific version link search...")
-                all_links = page.query_selector_all("a")
-                for link in all_links:
-                    href = link.get_attribute("href") or ""
-                    text = link.inner_text().lower()
-                    if version in text or f"download-{version.replace('.', '-')}" in href:
-                        version_link = href
-                        self.logger.info("Matched via fallback specific search")
-                        break
-            
-            if not version_link:
-                raise VersionNotFoundError(f"Could not find version {version} for {app_slug} on Uptodown")
-
-            # Step 4: Navigate to version page
-            self.logger.info(f"Navigating to version link: {version_link}")
-            page.goto(version_link, wait_until="domcontentloaded", timeout=45000)
-            self._wait(5)
-            
-            # Step 5: Find and click the large "Download" button on the version page
-            self.logger.info("Looking for the main download button...")
-            try:
-                self._find_download_button(page)
-            except Exception as e:
-                self.logger.error(f"Download button not found on Uptodown. Page title: {page.title()}")
-                # Log snippet
-                content = page.content()
-                self.logger.debug(f"First 500 chars of page: {content[:500]}")
-                raise DownloadError(f"Could not find the main Download button: {e}")
-
-            self.logger.info("Clicking the Download button...")
-            download = self._start_download(page)
-            
-            filepath, package_type = self._save_downloaded_file(
-                download,
-                app_slug,
-                version,
-            )
-            file_size = os.path.getsize(filepath)
-            self.logger.info(
-                f"Downloaded: {filepath} ({package_type}, {file_size:,} bytes)"
-            )
-            
-            return APKInfo(
-                filepath=filepath,
-                version=version,
-                source=self.SOURCE_NAME,
-                size_bytes=file_size,
-                app_name=app_slug,
-                package_type=package_type,
-                architectures=detect_architectures(filepath),
-            )
-            
-        except PlaywrightTimeout as e:
-            self.logger.error(f"Timeout: {e}")
-            raise DownloadError(f"Timeout while downloading: {e}")
-        finally:
-            self._close_browser(playwright, browser)
+        self.logger.info("Clicking the Download button...")
+        download = self._start_download(page)
+        
+        return self._save_downloaded_file(
+            download,
+            app_name,
+            version,
+            variant.variant_id,
+        )

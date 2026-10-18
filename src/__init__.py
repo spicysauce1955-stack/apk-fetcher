@@ -11,6 +11,10 @@ from .base import (
     setup_logging,
     detect_architectures,
     classify_package_zip,
+    arch_label,
+    find_existing_variant,
+    VariantRef,
+    ScrapeResult,
 )
 from .apkmirror import APKMirrorScraper
 from .uptodown import UptodownScraper
@@ -33,6 +37,10 @@ __all__ = [
     "setup_logging",
     "detect_architectures",
     "classify_package_zip",
+    "arch_label",
+    "find_existing_variant",
+    "VariantRef",
+    "ScrapeResult",
 ]
 
 # Source priority order for fallback

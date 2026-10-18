@@ -13,10 +13,12 @@ need maintenance over time.
 
 - Fetch one app/version, all configured versions, or a bulk JSON version list.
 - Try sources in priority order: APKMirror, then Uptodown, then APKPure.
-- Optionally download one package from every configured source with
-  `--all-sources`.
-- Skip already-downloaded files unless `--force` is provided.
-- Store downloads under `downloads/<app>/<app>-<version>-<source>.<type>`.
+- Download every variant a source lists for a version (e.g. both the `.apk`
+  and the `.apkm` on APKMirror).
+- Optionally download from every configured source with `--all-sources`.
+- Skip already-downloaded variants unless `--force` is provided.
+- Store downloads under
+  `downloads/<app>/<app>-<version>-<source>-<variant-id>-<arch>.<type>`.
 - Detect common Android package containers: `.apk`, `.xapk`, `.apkm`,
   `.apks`, and `.aab`.
 - Run headless by default, with visible-browser debug mode available.
@@ -120,7 +122,6 @@ apps:
       apkmirror:
         developer: telegram-fz-llc
         app_name: telegram
-        variant_index: 0
       uptodown:
         app_slug: telegram
       apkpure:
@@ -132,7 +133,6 @@ Source-specific keys:
 
 - `apkmirror.developer`: APKMirror developer slug.
 - `apkmirror.app_name`: APKMirror app slug.
-- `apkmirror.variant_index`: optional zero-based APK variant selector.
 - `uptodown.app_slug`: Uptodown app subdomain slug.
 - `apkpure.package`: Android package name.
 - `apkpure.app_slug`: optional APKPure app slug; defaults to `package`.
@@ -167,16 +167,26 @@ Downloaded files are named deterministically:
 ```text
 downloads/
 `-- telegram/
-    |-- telegram-12.4.0-apkmirror.apkm
-    |-- telegram-12.4.0-uptodown.apk
-    `-- telegram-12.4.0-apkpure.xapk
+    |-- telegram-13.0.3-apkmirror-1-universal.apk
+    |-- telegram-13.0.3-apkmirror-2-universal.apkm
+    |-- telegram-13.0.0-uptodown-1224906954-universal.apk
+    `-- telegram-12.10.0-apkpure-70242-arm64-v8a.xapk
 ```
 
-The extension is based on the downloaded file's content and browser-supplied
-filename. The skip check is filename-based across known package extensions, so
-`.apk`, `.xapk`, `.apkm`, `.apks`, `.aab`, and unknown `.download` files can
-all satisfy an existing download check. Removing a file, changing `--output`,
-or passing `--force` will cause the fetcher to attempt the download again.
+The variant ID is the source's own ID for that variant (APKMirror's variant
+number, Uptodown's version ID, APKPure's `versionCode`). `<arch>` comes from
+scanning the downloaded file: `universal` when it has no native code or ships
+all of `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`, otherwise the ABIs it
+contains joined with `+`. The extension is based on the downloaded file's
+content and browser-supplied filename.
+
+The skip check is per variant and filename-based across known package
+extensions, so `.apk`, `.xapk`, `.apkm`, `.apks`, `.aab`, and unknown
+`.download` files can all satisfy it. Each run still loads the version page to
+see which variants exist. Removing a file, changing `--output`, or passing
+`--force` will cause the fetcher to attempt that variant again. Files saved
+before variant support (`<app>-<version>-<source>.<type>`) are not recognised as
+any variant.
 
 Each successful download also logs the detected CPU architectures (ABIs) of the
 package, for example `Arch: arm64-v8a, x86_64`. Pure-Dalvik apps that contain

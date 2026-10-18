@@ -1,18 +1,76 @@
 #!/usr/bin/env python3
 """APKPure scraper using Playwright browser automation."""
 
-import os
-from typing import Optional
+import re
+from typing import List, Optional
+from urllib.parse import parse_qs, urlparse
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeout
+from bs4 import BeautifulSoup
 
 from .base import (
     BaseScraper,
     APKInfo,
+    VariantRef,
     VersionNotFoundError,
     DownloadError,
-    detect_architectures,
 )
+
+
+def _mentions_version(haystack: str, version: str, sep: str = ".") -> bool:
+    """True when haystack contains version as a whole version number.
+
+    "12.2.1" matches "Telegram 12.2.1" and ".../download/12.2.1" but not
+    "12.2.11" or "112.2.1"; sep="-" does the same for "12-2-1" slugs.
+    """
+    s = re.escape(sep)
+    pattern = rf"(?<!\d)(?<!\d{s}){re.escape(version)}(?!\d)(?!{s}\d)"
+    return re.search(pattern, haystack) is not None
+
+
+def _apkpure_version_code(href: str, package: str) -> Optional[str]:
+    """Return the versionCode of a direct download link for package."""
+    parsed = urlparse(href)
+    if parsed.netloc.lower() != "d.apkpure.com" or not parsed.path.startswith("/b/"):
+        return None
+    if parsed.path.rstrip("/").rsplit("/", 1)[-1].lower() != package.lower():
+        return None
+    codes = parse_qs(parsed.query).get("versionCode")
+    return codes[0] if codes else None
+
+
+def parse_apkpure_variants(html: str, package: str,
+                           version: str) -> List[VariantRef]:
+    """Parse the "All Variants" list of an APKPure version page.
+
+    Rows naming a different version are skipped. Falls back to any direct
+    download link for package when the list is missing. Links for other
+    packages (ads) are ignored.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    variants = []
+    seen_hrefs = set()
+
+    def add(href: str, label: str):
+        code = _apkpure_version_code(href, package)
+        if code and href not in seen_hrefs:
+            seen_hrefs.add(href)
+            variants.append(VariantRef(variant_id=code, url=href, label=label))
+
+    for row in soup.select("div.apk-variants div.apk"):
+        link = row.select_one("a.download-btn")
+        name = row.select_one(".name")
+        if not link or (name and name.get_text(strip=True) != version):
+            continue
+        tag = row.select_one(".tag")
+        group = row.find_previous("div", class_="group-title")
+        label_parts = [el.get_text(" ", strip=True) for el in (tag, group) if el]
+        add(link.get("href", ""), ", ".join(label_parts))
+
+    if not variants:
+        for link in soup.find_all("a", href=True):
+            add(link["href"], link.get_text(" ", strip=True))
+
+    return variants
 
 
 class APKPureScraper(BaseScraper):
@@ -35,10 +93,10 @@ class APKPureScraper(BaseScraper):
             text_lower = text.lower()
             href_lower = href.lower()
             has_version = (
-                version in text_lower
-                or version in href_lower
-                or version_slug in text_lower
-                or version_slug in href_lower
+                _mentions_version(text_lower, version)
+                or _mentions_version(href_lower, version)
+                or _mentions_version(text_lower, version_slug, "-")
+                or _mentions_version(href_lower, version_slug, "-")
             )
             if not has_version:
                 continue
@@ -48,9 +106,9 @@ class APKPureScraper(BaseScraper):
                 score += 4
             if "/versions" in href_lower:
                 score += 2
-            if version in text_lower:
+            if _mentions_version(text_lower, version):
                 score += 2
-            if version_slug in href_lower:
+            if _mentions_version(href_lower, version_slug, "-"):
                 score += 1
             if "variant" in href_lower:
                 score -= 1
@@ -68,131 +126,73 @@ class APKPureScraper(BaseScraper):
         )
         return href
 
-    def _find_package_download_link(self, page, package: str) -> Optional[str]:
-        """Find the direct APK/XAPK download URL for the requested package."""
-        package_lower = package.lower()
-        candidates = []
+    def _app_name(self, config: dict) -> str:
+        package = config.get("package")
+        if not package:
+            raise ValueError("APKPure config requires 'package'")
+        app_slug = config.get("app_slug", package)
+        return app_slug.split("/")[-1] if "/" in app_slug else app_slug
 
-        for link in page.query_selector_all("a"):
-            href = link.get_attribute("href") or ""
-            href_lower = href.lower()
-            if package_lower not in href_lower:
-                continue
-            if "d.apkpure.com/b/" not in href_lower:
-                continue
-
-            text = link.inner_text().strip()
-            text_lower = text.lower()
-            score = 0
-            if "/b/apk/" in href_lower:
-                score += 4
-            if "/b/xapk/" in href_lower:
-                score += 3
-            if "download apk" in text_lower:
-                score += 3
-            if "download" in text_lower:
-                score += 1
-
-            candidates.append((score, link, href, text))
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        score, _link, href, text = candidates[0]
-        self.logger.debug(
-            f"Matched APKPure package download score={score}, href={href!r}, "
-            f"text={text[:80]!r}"
-        )
-        return href
-    
-    def scrape(self, config: dict, version: str) -> Optional[APKInfo]:
+    def _list_variants(self, page, config: dict,
+                       version: str) -> List[VariantRef]:
         """
-        Download APK from APKPure.
+        List every variant on the APKPure version page.
         
         Config requires:
             - package: Package name (e.g., "org.telegram.messenger")
             - app_slug: Optional app slug for URL (e.g., "telegram")
         """
-        package = config.get("package")
+        package = config["package"]
         app_slug = config.get("app_slug", package)
-        
-        if not package:
-            raise ValueError("APKPure config requires 'package'")
         
         # APKPure URL format: /app-name/package-name/versions
         versions_url = f"{self.BASE_URL}/{app_slug}/{package}/versions"
         
         self.logger.info(f"Fetching {package} v{version} from APKPure")
         
-        playwright, browser, page = self._get_browser()
+        # Step 1: Load versions page
+        self.logger.info(f"Loading versions page: {versions_url}")
+        page.goto(versions_url, wait_until="domcontentloaded", timeout=30000)
+        self._wait(5)
         
-        try:
-            # Step 1: Load versions page
-            self.logger.info(f"Loading versions page: {versions_url}")
-            page.goto(versions_url, wait_until="domcontentloaded", timeout=30000)
-            self._wait(5)
-            
-            self.logger.debug(f"Page title: {page.title()}")
-            content = page.content()
-            
-            # Step 2: Find the target version
-            self.logger.info("Searching for version links...")
-            version_link = self._find_version_link(page, version)
-            
-            if not version_link:
-                if "cloudflare" in content.lower() or "verify you are human" in content.lower():
-                    self.logger.error("Blocked by Cloudflare on APKPure")
-                raise VersionNotFoundError(f"Version {version} not found on APKPure")
+        self.logger.debug(f"Page title: {page.title()}")
+        content = page.content()
+        
+        # Step 2: Find the target version
+        self.logger.info("Searching for version links...")
+        version_link = self._find_version_link(page, version)
+        
+        if not version_link:
+            if "cloudflare" in content.lower() or "verify you are human" in content.lower():
+                self.logger.error("Blocked by Cloudflare on APKPure")
+            raise VersionNotFoundError(f"Version {version} not found on APKPure")
 
-            self.logger.info("Found version link")
-            
-            # Step 3: Navigate to download page
-            if not version_link.startswith("http"):
-                version_link = self.BASE_URL + version_link
-            
-            page.goto(version_link, wait_until="domcontentloaded", timeout=30000)
-            self._wait(2)
-            
-            # Step 4: Find the direct package download URL
-            download_url = self._find_package_download_link(page, package)
-            
-            if not download_url:
-                raise DownloadError(
-                    "Direct package download link not found on APKPure "
-                    "version page"
-                )
-            
-            # Step 5: Download
-            self.logger.info("Starting download...")
-            app_name = app_slug.split("/")[-1] if "/" in app_slug else app_slug
-            try:
-                filepath, package_type = self._save_url_file(
-                    download_url,
-                    app_name,
-                    version,
-                    referer=page.url,
-                )
-            except Exception as e:
-                raise DownloadError(f"Direct package download failed: {e}") from e
-            file_size = os.path.getsize(filepath)
-            
-            self.logger.info(
-                f"Downloaded: {filepath} ({package_type}, {file_size:,} bytes)"
+        self.logger.info("Found version link")
+        
+        # Step 3: Navigate to the version page and read its variants
+        if not version_link.startswith("http"):
+            version_link = self.BASE_URL + version_link
+        
+        page.goto(version_link, wait_until="domcontentloaded", timeout=30000)
+        self._wait(2)
+        
+        variants = parse_apkpure_variants(page.content(), package, version)
+        if not variants:
+            raise DownloadError(
+                "Direct package download link not found on APKPure "
+                "version page"
             )
-            
-            return APKInfo(
-                filepath=filepath,
-                version=version,
-                source=self.SOURCE_NAME,
-                size_bytes=file_size,
-                app_name=app_name,
-                package_type=package_type,
-                architectures=detect_architectures(filepath),
+        return variants
+
+    def _download_variant(self, page, app_name: str, version: str,
+                          variant: VariantRef) -> APKInfo:
+        try:
+            return self._save_url_file(
+                variant.url,
+                app_name,
+                version,
+                variant.variant_id,
+                referer=page.url,
             )
-            
-        except PlaywrightTimeout as e:
-            self.logger.error(f"Timeout: {e}")
-            raise DownloadError(f"Timeout while downloading: {e}")
-        finally:
-            self._close_browser(playwright, browser)
+        except Exception as e:
+            raise DownloadError(f"Direct package download failed: {e}") from e
