@@ -5,19 +5,21 @@ Base scraper abstraction with common functionality.
 
 import io
 import os
+import re
 import shutil
 import tempfile
 import time
 import logging
 import zipfile
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from urllib.request import Request, urlopen
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeout
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import TimeoutError as PlaywrightTimeout
+from patchright.sync_api import sync_playwright
 
 
 PACKAGE_EXTENSIONS = {
@@ -30,8 +32,24 @@ PACKAGE_EXTENSIONS = {
 
 PACKAGE_FILE_EXTENSIONS = tuple(PACKAGE_EXTENSIONS.keys())
 
-# Saved packages use a known extension, or ".download" when unrecognised.
-SAVED_FILE_EXTENSIONS = PACKAGE_FILE_EXTENSIONS + (".download",)
+# Titles of the interstitial pages that replace a page behind a bot check.
+# Page HTML is no use here: ordinary pages also embed Cloudflare's scripts.
+CHALLENGE_TITLES = ("just a moment", "attention required")
+
+# Settings a snap-packaged GUI app (e.g. VS Code) leaks into its terminals.
+SNAP_GUI_VARIABLES = (
+    "GSETTINGS_SCHEMA_DIR",
+    "GTK_PATH",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GIO_MODULE_DIR",
+)
+
+# Chrome profile kept between runs so a completed bot check carries over.
+BROWSER_PROFILE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "browser-profile",
+)
 
 SYSTEM_CHROME_CANDIDATES = (
     "google-chrome",
@@ -78,6 +96,20 @@ KNOWN_ABIS = {
     "mips",
     "mips64",
 }
+
+# Names accepted by --platform. As in Android's own ABIs, "arm" and "x86" are
+# the 32-bit platforms.
+PLATFORM_ABIS = {
+    "arm": "armeabi-v7a",
+    "armeabi-v7a": "armeabi-v7a",
+    "arm64": "arm64-v8a",
+    "arm64-v8a": "arm64-v8a",
+    "x86": "x86",
+    "x86_64": "x86_64",
+}
+
+# Whole words only, so "x86" never matches inside "x86_64".
+ABI_IN_LABEL = re.compile(r"(?<![\w-])(" + "|".join(KNOWN_ABIS) + r")(?![\w-])")
 
 
 def _abis_from_names(names) -> set:
@@ -157,14 +189,48 @@ def arch_label(abis: list) -> str:
     return "+".join(sorted(abis))
 
 
+def supports_platforms(abis: list, platforms) -> bool:
+    """True when a package with these ABIs runs on every requested platform."""
+    return abis == ["universal"] or set(platforms) <= set(abis)
+
+
+def label_excludes_platforms(label: str, platforms) -> bool:
+    """True when a listing label names ABIs that miss a requested platform.
+
+    A label naming no ABI, such as "universal" or "apk", proves nothing, so
+    the downloaded file has to be checked instead.
+    """
+    named = set(ABI_IN_LABEL.findall(label.lower()))
+    return bool(named) and not set(platforms) <= named
+
+
+def is_version_number(text: str) -> bool:
+    """True for plain dotted numbers; betas and other suffixes do not count."""
+    return re.fullmatch(r"\d+(\.\d+)*", text) is not None
+
+
+def version_key(version: str) -> Tuple[int, ...]:
+    """Sort key for versions, treating 13.2 and 13.2.0 as the same version."""
+    parts = [int(part) for part in re.findall(r"\d+", version)]
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def last_word(text: str) -> str:
+    """Return the final word of text, or "" when there is none."""
+    words = text.split()
+    return words[-1] if words else ""
+
+
 def variant_file_prefix(app_name: str, version: str, source: str,
                         variant_id: str) -> str:
     """Filename prefix shared by every saved file of one variant."""
     return f"{app_name}-{version}-{source}-{variant_id}-"
 
 
-def _saved_files(output_dir: str, app_name: str, prefixes: tuple) -> list:
-    """Paths of saved packages whose filename starts with one of prefixes."""
+def _matching_files(output_dir: str, app_name: str, prefixes: tuple) -> list:
+    """Paths in the app folder whose filename starts with one of prefixes."""
     app_dir = os.path.join(output_dir, app_name)
     if not os.path.isdir(app_dir):
         return []
@@ -172,15 +238,20 @@ def _saved_files(output_dir: str, app_name: str, prefixes: tuple) -> list:
     return [
         os.path.join(app_dir, filename)
         for filename in os.listdir(app_dir)
-        if filename.startswith(prefixes) and filename.endswith(SAVED_FILE_EXTENSIONS)
+        if filename.startswith(prefixes)
     ]
 
 
-def _variant_files(output_dir: str, app_name: str, version: str, source: str,
-                   variant_id: str) -> list:
-    """Paths of saved packages for one variant, in directory order."""
-    prefix = variant_file_prefix(app_name, version, source, variant_id)
-    return _saved_files(output_dir, app_name, (prefix,))
+def _saved_files(output_dir: str, app_name: str, prefixes: tuple) -> list:
+    """Paths of usable saved packages whose filename starts with prefixes.
+
+    Empty files and anything that is not a package do not count as saved.
+    """
+    return [
+        path for path in _matching_files(output_dir, app_name, prefixes)
+        if path.endswith(PACKAGE_FILE_EXTENSIONS)
+        and classify_package_zip(path) != "unknown"
+    ]
 
 
 def _source_version_files(output_dir: str, app_name: str, version: str,
@@ -196,7 +267,8 @@ def _source_version_files(output_dir: str, app_name: str, version: str,
 def find_existing_variant(output_dir: str, app_name: str, version: str,
                           source: str, variant_id: str) -> Optional[str]:
     """Return the saved file for this variant, if one exists."""
-    matches = _variant_files(output_dir, app_name, version, source, variant_id)
+    prefix = variant_file_prefix(app_name, version, source, variant_id)
+    matches = _saved_files(output_dir, app_name, (prefix,))
     return matches[0] if matches else None
 
 
@@ -215,9 +287,77 @@ class DownloadError(ScraperError):
     pass
 
 
-class RateLimitError(ScraperError):
+class SourceBlockedError(ScraperError):
+    """Raised when the source refuses the request or demands a bot check."""
+    pass
+
+
+class RateLimitError(SourceBlockedError):
     """Raised when rate limited by the source."""
     pass
+
+
+class PlatformMismatchError(ScraperError):
+    """Raised when a package does not support the requested platforms."""
+    pass
+
+
+def is_challenge_title(title: str) -> bool:
+    """True when a page title belongs to a bot-check interstitial."""
+    lowered = title.lower()
+    return any(marker in lowered for marker in CHALLENGE_TITLES)
+
+
+def package_problem(filepath: str) -> Optional[str]:
+    """Explain why filepath is not a complete Android package, or None if it is."""
+    if classify_package_zip(filepath) == "unknown":
+        return "not a recognised Android package"
+
+    try:
+        with zipfile.ZipFile(filepath) as archive:
+            # A package's first entry sits at byte 0. Anything later means
+            # zipfile found the footer of an APK nested inside a bundle that
+            # was cut off right after it.
+            if min(info.header_offset for info in archive.infolist()) != 0:
+                return "only part of the archive arrived"
+            corrupt = archive.testzip()
+    except (zipfile.BadZipFile, EOFError, OSError, RuntimeError,
+            NotImplementedError, zlib.error) as e:
+        return f"unreadable archive ({e})"
+
+    return f"corrupt entry {corrupt}" if corrupt else None
+
+
+def browser_environment(environ) -> dict:
+    """Copy environ without GUI settings leaked by a snap-packaged parent.
+
+    Terminals opened from a snap app such as VS Code inherit these, and they
+    crash a visible Chrome at startup.
+    """
+    cleaned = {
+        name: value for name, value in environ.items()
+        if not (name in SNAP_GUI_VARIABLES and "/snap/" in value)
+    }
+    if "XDG_DATA_DIRS" in cleaned:
+        cleaned["XDG_DATA_DIRS"] = ":".join(
+            folder for folder in cleaned["XDG_DATA_DIRS"].split(":")
+            if "/snap/" not in folder
+        )
+    return cleaned
+
+
+def browser_launch_hint(environ) -> str:
+    """Suggest the most likely fix for a failed browser launch."""
+    if environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"):
+        return (
+            "Check that `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` points to a "
+            "working Chrome/Chromium executable."
+        )
+    return (
+        "Run `patchright install chromium` or set "
+        "`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to a working Chrome/Chromium "
+        "executable."
+    )
 
 
 @dataclass
@@ -282,10 +422,14 @@ class BaseScraper(ABC):
     """Abstract base class for APK scrapers."""
 
     SOURCE_NAME: str = "unknown"
+    CHALLENGE_WAIT_SECONDS: int = 180
+    DOWNLOAD_SAVE_TIMEOUT_SECONDS: int = 1200
 
-    def __init__(self, output_dir: str = "./downloads", headless: bool = True):
+    def __init__(self, output_dir: str = "./downloads", headless: bool = True,
+                 platforms=()):
         self.output_dir = output_dir
         self.headless = headless
+        self.platforms = platforms
         self.logger = logging.getLogger(self.__class__.__name__)
         os.makedirs(output_dir, exist_ok=True)
 
@@ -301,7 +445,8 @@ class BaseScraper(ABC):
 
         Raises:
             VersionNotFoundError: the source lists no variants for version
-            DownloadError: every variant failed to download
+            PlatformMismatchError: no variant supports the requested platforms
+            DownloadError: every variant tried failed to download
         """
         app_name = self._app_name(config)
         playwright, browser, page = self._get_browser()
@@ -319,9 +464,12 @@ class BaseScraper(ABC):
                 # A blocked or changed page must not make a version that is
                 # already on disk fall through to (and re-download from) the
                 # next source.
-                saved = [] if force else _source_version_files(
-                    self.output_dir, app_name, version, self.SOURCE_NAME,
-                )
+                saved = [] if force else [
+                    path for path in _source_version_files(
+                        self.output_dir, app_name, version, self.SOURCE_NAME,
+                    )
+                    if self._suits_platforms(path)
+                ]
                 if not saved:
                     raise
                 self.logger.warning(
@@ -337,10 +485,23 @@ class BaseScraper(ABC):
                 if variant.label:
                     description += f" ({variant.label})"
 
+                if label_excludes_platforms(variant.label, self.platforms):
+                    self.logger.info(
+                        f"Skipping {description}: not for "
+                        f"{', '.join(self.platforms)}"
+                    )
+                    continue
+
                 existing = None if force else find_existing_variant(
                     self.output_dir, app_name, version, self.SOURCE_NAME,
                     variant.variant_id,
                 )
+                if existing and not self._suits_platforms(existing):
+                    self.logger.info(
+                        f"Skipping {description}: saved file is not for "
+                        f"{', '.join(self.platforms)}"
+                    )
+                    continue
                 if existing:
                     self.logger.info(f"Skipping {description}: {existing}")
                     result.existing.append(existing)
@@ -350,6 +511,9 @@ class BaseScraper(ABC):
                 try:
                     info = self._download_variant(page, app_name, version,
                                                   variant)
+                except PlatformMismatchError as e:
+                    self.logger.info(f"Discarded {description}: {e}")
+                    continue
                 except Exception as e:
                     self.logger.warning(f"Failed {description}: {e}")
                     result.failed.append((variant.variant_id, str(e)))
@@ -361,11 +525,16 @@ class BaseScraper(ABC):
                 )
                 result.downloaded.append(info)
 
-            if not result.succeeded:
+            if result.failed and not result.succeeded:
                 reasons = "; ".join(f"{vid}: {reason}"
                                     for vid, reason in result.failed)
                 raise DownloadError(
-                    f"All {len(variants)} variant(s) failed ({reasons})"
+                    f"All {len(result.failed)} variant(s) failed ({reasons})"
+                )
+            if not result.succeeded:
+                raise PlatformMismatchError(
+                    f"No variant of {version} on {self.SOURCE_NAME} supports "
+                    f"{', '.join(self.platforms)}"
                 )
             return result
 
@@ -375,9 +544,36 @@ class BaseScraper(ABC):
         finally:
             self._close_browser(playwright, browser)
 
+    def newest_version(self, config: dict) -> str:
+        """Return the highest release number the source lists for the app.
+
+        Betas and anything else that is not a plain number are ignored.
+        """
+        self._app_name(config)
+        playwright, browser, page = self._get_browser()
+        try:
+            releases = [version for version in self._list_versions(page, config)
+                        if is_version_number(version)]
+        finally:
+            self._close_browser(playwright, browser)
+
+        if not releases:
+            raise ScraperError(f"{self.SOURCE_NAME} listed no version numbers")
+        return max(releases, key=version_key)
+
+    def _suits_platforms(self, path: str) -> bool:
+        """True when a saved package supports the requested platforms."""
+        return not self.platforms or supports_platforms(
+            detect_architectures(path), self.platforms
+        )
+
     @abstractmethod
     def _app_name(self, config: dict) -> str:
         """Validate config and return the name used for folders and files."""
+
+    @abstractmethod
+    def _list_versions(self, page, config: dict) -> List[str]:
+        """Return the version numbers the source lists for the app, any order."""
 
     @abstractmethod
     def _list_variants(self, page, config: dict,
@@ -396,17 +592,11 @@ class BaseScraper(ABC):
         """
 
     def _get_browser(self) -> tuple:
-        """Create a Playwright browser instance."""
+        """Start the browser and return (playwright, context, page)."""
         playwright = sync_playwright().start()
         try:
-            browser = self._launch_browser(playwright)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-            return playwright, browser, page
+            context = self._launch_browser(playwright)
+            return playwright, context, context.pages[0]
         except Exception:
             playwright.stop()
             raise
@@ -416,13 +606,19 @@ class BaseScraper(ABC):
         errors = []
 
         for label, executable_path in self._browser_candidates():
-            launch_kwargs = {"headless": self.headless}
+            launch_kwargs = {
+                "headless": self.headless,
+                "env": browser_environment(os.environ),
+                "no_viewport": not self.headless,
+            }
             if executable_path:
                 launch_kwargs["executable_path"] = executable_path
 
             try:
                 self.logger.debug(f"Launching browser: {label}")
-                return playwright.chromium.launch(**launch_kwargs)
+                return playwright.chromium.launch_persistent_context(
+                    BROWSER_PROFILE_DIR, **launch_kwargs
+                )
             except PlaywrightError as e:
                 message = str(e).splitlines()[0]
                 errors.append(f"{label}: {message}")
@@ -430,10 +626,8 @@ class BaseScraper(ABC):
 
         tried = "; ".join(errors) if errors else "no browser candidates found"
         raise DownloadError(
-            "Could not launch Chromium. Tried: "
-            f"{tried}. Run `playwright install chromium` or set "
-            "`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to a working "
-            "Chrome/Chromium executable."
+            f"Could not launch Chromium. Tried: {tried}. "
+            f"{browser_launch_hint(os.environ)}"
         )
 
     def _browser_candidates(self):
@@ -442,7 +636,7 @@ class BaseScraper(ABC):
         if env_path:
             return [(f"configured browser ({env_path})", env_path)]
 
-        candidates = [("Playwright bundled Chromium", None)]
+        candidates = [("Patchright bundled Chromium", None)]
         seen = set()
 
         for candidate in SYSTEM_CHROME_CANDIDATES:
@@ -464,7 +658,87 @@ class BaseScraper(ABC):
             playwright.stop()
         except Exception:
             pass
-    
+
+    def _open(self, page, url: str, timeout: int = 30000):
+        """Navigate to url, raising SourceBlockedError if the source refuses."""
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+
+        if is_challenge_title(page.title()):
+            self._clear_challenge(page, url)
+            return
+
+        status = response.status if response else None
+        if status == 429:
+            raise RateLimitError(
+                f"{self.SOURCE_NAME} rate limited the request for {url} "
+                "(HTTP 429)"
+            )
+        if status in (403, 503):
+            raise SourceBlockedError(
+                f"{self.SOURCE_NAME} refused the request for {url} "
+                f"(HTTP {status})"
+            )
+
+    def _clear_challenge(self, page, url: str):
+        """Give a person time to pass a bot check in a visible browser."""
+        if self.headless:
+            raise SourceBlockedError(
+                f"{self.SOURCE_NAME} answered {url} with a bot check that the "
+                "headless browser cannot complete; try --no-headless"
+            )
+
+        self.logger.warning(
+            f"Bot check on {self.SOURCE_NAME}. Complete it in the browser "
+            f"window; waiting up to {self.CHALLENGE_WAIT_SECONDS}s"
+        )
+        deadline = time.monotonic() + self.CHALLENGE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(1000)
+            try:
+                if not is_challenge_title(page.title()):
+                    page.wait_for_load_state("domcontentloaded")
+                    return
+            except PlaywrightError:
+                continue  # the page is navigating
+
+        raise SourceBlockedError(
+            f"The bot check on {self.SOURCE_NAME} was not completed within "
+            f"{self.CHALLENGE_WAIT_SECONDS}s"
+        )
+
+    def _save_with_deadline(self, download, path: str):
+        """Save a browser download, cancelling it if it outlasts the deadline.
+
+        save_as has no timeout and blocks until the transfer ends. Navigation
+        events from a timer tab still reach their handler during that block,
+        which gives it the chance to cancel a stalled transfer. Patchright
+        disables console events, so they cannot do this job.
+        """
+        deadline = time.monotonic() + self.DOWNLOAD_SAVE_TIMEOUT_SECONDS
+        timed_out = []
+
+        def on_tick(_frame):
+            if not timed_out and time.monotonic() >= deadline:
+                timed_out.append(True)
+                download.cancel()
+
+        timer = download.page.context.new_page()
+        try:
+            timer.on("framenavigated", on_tick)
+            timer.evaluate(
+                "setInterval(() => { location.hash = Date.now(); }, 1000)"
+            )
+            download.save_as(path)
+        except PlaywrightError as e:
+            if timed_out:
+                raise DownloadError(
+                    "Download did not finish within "
+                    f"{self.DOWNLOAD_SAVE_TIMEOUT_SECONDS}s and was cancelled"
+                ) from e
+            raise
+        finally:
+            timer.close()
+
     def _save_downloaded_file(self, download, app_name: str, version: str,
                               variant_id: str) -> APKInfo:
         """Save a Playwright download and keep the detected package extension."""
@@ -482,7 +756,7 @@ class BaseScraper(ABC):
         os.close(fd)
 
         try:
-            download.save_as(temp_path)
+            self._save_with_deadline(download, temp_path)
             return self._finalize_downloaded_file(
                 temp_path,
                 app_name,
@@ -522,9 +796,18 @@ class BaseScraper(ABC):
             request = Request(url, headers=headers)
             with urlopen(request, timeout=timeout) as response:
                 suggested_filename = response.headers.get_filename() or ""
+                declared_size = response.headers.get("Content-Length", "")
                 with os.fdopen(fd, "wb") as file_obj:
                     fd = None
                     shutil.copyfileobj(response, file_obj)
+
+            # urllib does not raise when a connection closes early.
+            received = os.path.getsize(temp_path)
+            if declared_size.isdigit() and received != int(declared_size):
+                raise DownloadError(
+                    f"Incomplete download: received {received:,} of "
+                    f"{int(declared_size):,} bytes"
+                )
 
             return self._finalize_downloaded_file(
                 temp_path,
@@ -545,24 +828,34 @@ class BaseScraper(ABC):
                                   suggested_filename: str = "") -> APKInfo:
         """Rename a temporary package file to its variant filename.
 
-        The name carries the detected extension and an ABI label, so any
-        earlier file for the same variant (e.g. with a different label) is
-        removed first.
+        Anything but a complete package is refused before an earlier file for
+        the variant is touched. The name carries the detected extension and
+        an ABI label, so an earlier file (e.g. with a different label) is
+        removed once the new one is in place.
         """
+        problem = package_problem(temp_path)
+        if problem:
+            raise DownloadError(f"Download is not usable: {problem}")
+
         package_type, extension = self._identify_package_file(
             temp_path,
             suggested_filename,
         )
         architectures = detect_architectures(temp_path)
+        if not supports_platforms(architectures, self.platforms):
+            raise PlatformMismatchError(
+                f"the file supports {', '.join(architectures)}, not "
+                f"{', '.join(self.platforms)}"
+            )
         prefix = variant_file_prefix(app_name, version, self.SOURCE_NAME,
                                      variant_id)
         filename = f"{prefix}{arch_label(architectures)}{extension}"
         filepath = os.path.join(self.output_dir, app_name, filename)
 
-        for stale in _variant_files(self.output_dir, app_name, version,
-                                    self.SOURCE_NAME, variant_id):
-            os.remove(stale)
         os.replace(temp_path, filepath)
+        for other in _matching_files(self.output_dir, app_name, (prefix,)):
+            if other != filepath:
+                os.remove(other)
 
         return APKInfo(
             filepath=filepath,
@@ -602,10 +895,9 @@ class BaseScraper(ABC):
                 return suggested_type, suggested_ext
             return "apks", ".apks"
 
-        if suggested_type:
-            return suggested_type, suggested_ext
-
-        return "unknown", ".download"
+        raise DownloadError(
+            f"Unrecognised package content in {os.path.basename(filepath)}"
+        )
 
     def _classify_package_zip(self, filepath: str) -> str:
         """Classify common Android package containers by ZIP contents."""

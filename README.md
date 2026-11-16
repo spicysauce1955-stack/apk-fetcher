@@ -1,7 +1,7 @@
 # APK Fetcher
 
 APK Fetcher is a Python CLI for downloading specific Android APK versions from
-multiple third-party APK sources. It is config-driven, uses Playwright browser
+multiple third-party APK sources. It is config-driven, uses Patchright browser
 automation, and can fall back across APKMirror, Uptodown, and APKPure when a
 version is missing or a source fails.
 
@@ -21,14 +21,15 @@ need maintenance over time.
   `downloads/<app>/<app>-<version>-<source>-<variant-id>-<arch>.<type>`.
 - Detect common Android package containers: `.apk`, `.xapk`, `.apkm`,
   `.apks`, and `.aab`.
-- Run headless by default, with visible-browser debug mode available.
-- Support Playwright's bundled Chromium or a system Chrome/Chromium binary.
+- Show the browser so a person can complete bot checks, with headless mode
+  available through `config.yaml`.
+- Support Patchright's bundled Chromium or a system Chrome/Chromium binary.
 
 ## Requirements
 
 - Python 3.10 or newer.
 - A Chromium-compatible browser:
-  - Playwright-managed Chromium via `playwright install chromium`, or
+  - Patchright-managed Chromium via `patchright install chromium`, or
   - a system Chrome/Chromium path set with `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`.
 - Network access to the configured APK sources.
 
@@ -41,10 +42,10 @@ cd apk-fetcher
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
+patchright install chromium
 ```
 
-If Playwright's browser download is unavailable in your environment, use an
+If Patchright's browser download is unavailable in your environment, use an
 installed Chrome/Chromium binary instead:
 
 ```bash
@@ -56,6 +57,13 @@ The repository also includes `run.sh`, which uses `./venv/bin/python`, defaults
 and forwards all arguments to `main.py`.
 
 ## Quick Start
+
+Fetch one version. A Chrome window opens, and if a bot check appears, complete
+it there:
+
+```bash
+./run.sh --version 13.2.1
+```
 
 Fetch every app/version declared in `config.yaml`:
 
@@ -94,6 +102,26 @@ Bulk-fetch versions from `versions.json`:
 ./run.sh --app telegram --bulk versions.json
 ```
 
+Download every variant from every source, instead of stopping at the first
+source that works:
+
+```bash
+./run.sh --version 13.2.0 --all-sources
+```
+
+Keep only packages that support particular platforms:
+
+```bash
+./run.sh --version 13.2.0 --platform x86
+./run.sh --version 13.2.0 --platform arm64,x86
+```
+
+Find out whether anything newer than a version is listed, downloading nothing:
+
+```bash
+./run.sh --check 13.2.0
+```
+
 Run with a visible browser and debug logs:
 
 ```bash
@@ -112,7 +140,7 @@ Direct Python invocation works too:
 
 ```yaml
 output_dir: ./downloads
-headless: true
+headless: false
 
 apps:
   telegram:
@@ -147,6 +175,8 @@ Selection:
   --app, -a APP             App key from config.yaml. Defaults to all apps.
   --version, -v VERSION     Version to fetch. Defaults to app versions in config.
   --bulk, -b FILE           JSON file containing objects with a version field.
+  --check VERSION           Download nothing; report anything newer than VERSION.
+  --platform, -p LIST       Keep only packages supporting every listed platform.
 
 Execution:
   --config, -c FILE         Config file path. Default: config.yaml.
@@ -159,6 +189,15 @@ Execution:
 ```
 
 `--all-sources` cannot be combined with `--source`.
+
+`--platform` takes a comma-separated list of `arm` (32-bit), `arm64`,
+`x86` (32-bit) and `x86_64`. The Android names `armeabi-v7a` and `arm64-v8a` also
+work. A package must support every platform listed.
+
+`--check` exits `3` when a newer version is listed, `0` when every source was
+read and none is newer, and `1` when it could not read every source and found
+nothing newer. It cannot be combined with `--version`, `--bulk`, `--force` or
+`--platform`.
 
 ## Output Layout
 
@@ -180,9 +219,9 @@ all of `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`, otherwise the ABIs it
 contains joined with `+`. The extension is based on the downloaded file's
 content and browser-supplied filename.
 
-The skip check is per variant and filename-based across known package
-extensions, so `.apk`, `.xapk`, `.apkm`, `.apks`, `.aab`, and unknown
-`.download` files can all satisfy it. Each run still loads the version page to
+The skip check is per variant across known package extensions (`.apk`, `.xapk`,
+`.apkm`, `.apks`, `.aab`), and empty or non-package files do not satisfy it.
+Each run still loads the version page to
 see which variants exist. Removing a file, changing `--output`, or passing
 `--force` will cause the fetcher to attempt that variant again. Files saved
 before variant support (`<app>-<version>-<source>.<type>`) are not recognised as
@@ -215,10 +254,13 @@ apk-fetcher/
 
 - APK source websites may change markup, flows, ads, or bot protections without
   notice. A scraper can break even when the CLI is unchanged.
-- APKPure is Cloudflare-protected and is the least reliable source in headless
-  automation, even though the scraper uses the mobile site.
-- Existing package files are not hashed or verified; the project only checks
-  for a matching filename before skipping.
+- All three sources use Cloudflare bot checks, so headless runs are often
+  blocked. The shipped `config.yaml` therefore shows the browser window, where
+  a person can complete a check when one appears. The browser keeps its profile
+  in `browser-profile/`, so a completed check carries over to later runs for as
+  long as the site allows. Delete that folder to start fresh.
+- Existing package files are not hashed; before skipping, the project only
+  checks for a matching filename that still reads as a package.
 
 ## Testing
 

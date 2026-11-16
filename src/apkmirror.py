@@ -11,6 +11,7 @@ from .base import (
     VariantRef,
     VersionNotFoundError,
     DownloadError,
+    last_word,
 )
 
 
@@ -68,6 +69,21 @@ def parse_apkmirror_variants(html: str, app_name: str,
     return variants
 
 
+def parse_apkmirror_versions(html: str, developer: str,
+                             app_name: str) -> List[str]:
+    """Read release titles from an app's APKMirror page.
+
+    The page also lists other apps, which link elsewhere. A release title ends
+    in its version, so the last word of a beta's title is "beta".
+    """
+    prefix = f"/apk/{developer}/{app_name}/{app_name}-"
+    titles = [link.get_text(" ", strip=True)
+              for link in BeautifulSoup(html, "lxml").select("a[href]")
+              if link["href"].startswith(prefix)
+              and link["href"].rstrip("/").endswith("-release")]
+    return [last_word(title) for title in titles if title]
+
+
 class APKMirrorScraper(BaseScraper):
     """Scraper for APKMirror.com using Playwright."""
 
@@ -88,6 +104,13 @@ class APKMirrorScraper(BaseScraper):
             )
         return app_name
 
+    def _list_versions(self, page, config: dict) -> List[str]:
+        developer = config["developer"]
+        app_name = config["app_name"]
+        self._open(page, f"{self.BASE_URL}/apk/{developer}/{app_name}/")
+        self._wait(2)
+        return parse_apkmirror_versions(page.content(), developer, app_name)
+
     def _list_variants(self, page, config: dict,
                        version: str) -> List[VariantRef]:
         """
@@ -105,7 +128,7 @@ class APKMirrorScraper(BaseScraper):
         self.logger.info(f"Fetching {app_name} v{version} from APKMirror")
         self.logger.debug(f"Version URL: {version_url}")
 
-        page.goto(version_url, wait_until="domcontentloaded", timeout=30000)
+        self._open(page, version_url)
         self._wait(2)
 
         # Check for 404
@@ -117,7 +140,7 @@ class APKMirrorScraper(BaseScraper):
     def _download_variant(self, page, app_name: str, version: str,
                           variant: VariantRef) -> APKInfo:
         # Step 1: Open the variant page
-        page.goto(variant.url, wait_until="domcontentloaded", timeout=30000)
+        self._open(page, variant.url)
         self._wait(2)
 
         # Step 2: Find download button
@@ -126,7 +149,7 @@ class APKMirrorScraper(BaseScraper):
             raise DownloadError("Download button not found on variant page")
 
         download_page_href = download_btn.get_attribute("href")
-        page.goto(self.BASE_URL + download_page_href, wait_until="domcontentloaded", timeout=30000)
+        self._open(page, self.BASE_URL + download_page_href)
         self._wait(3)
 
         # Step 3: Find final download link

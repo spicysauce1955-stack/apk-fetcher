@@ -2,7 +2,8 @@
 # Define apps and versions to fetch
 
 output_dir: ./downloads
-headless: true
+# Cloudflare blocks headless runs on all three sources, so show the browser.
+headless: false
 
 apps:
   telegram:
