@@ -23,10 +23,19 @@ Failures are handled per source:
 
 - `VersionNotFoundError`: the version was not found on that source.
 - `DownloadError`: the version may exist, but the download flow failed.
+- `SourceBlockedError`: the source refused the request, answered with a bot
+  check, or rate limited it (`RateLimitError`).
+- `PlatformMismatchError`: no variant on that source supports the platforms
+  requested with `--platform`. This is not counted as a source error.
 - `ScraperError`: source-specific scraper failure.
 - unexpected exceptions: logged and treated as source failures.
 
 One failed source does not stop fallback to the next source.
+
+The process exits `0` only when every requested version was fully fetched. A
+version is partial when a source succeeded but one of its variants failed, or,
+with `--all-sources`, when a source errored. Partial and failed versions are
+counted in the final summary and make the run exit `1`.
 
 ## Configuration File
 
@@ -34,7 +43,7 @@ The default config path is `config.yaml`. Use `--config` to load another file.
 
 ```yaml
 output_dir: ./downloads
-headless: true
+headless: false
 
 apps:
   telegram:
@@ -60,7 +69,7 @@ CLI `--output` flag overrides it.
 
 `headless`
 
-Whether Playwright runs without a visible browser. Defaults to `true` if
+Whether the browser runs without a visible window. Defaults to `true` if
 omitted. The CLI `--no-headless` flag overrides it for a run.
 
 ### App Keys
@@ -117,9 +126,9 @@ https://<app_slug>.en.uptodown.com/android/versions
 Uptodown lists a version once per variant, so every row whose version number
 matches the requested version exactly is downloaded. Each row's
 `data-version-id` is the variant ID in the filename and addresses its download
-page (`https://<app_slug>.en.uptodown.com/android/download/<id>`). Only the
-first page of the version list is searched. Uptodown markup changes can affect
-this flow.
+page (`https://<app_slug>.en.uptodown.com/android/download/<id>`). The scraper
+clicks "See more" until the newest-first list has moved past the requested
+version or runs out. Uptodown markup changes can affect this flow.
 
 ### APKPure
 
@@ -193,7 +202,7 @@ See [Telling variants apart](#telling-variants-apart) for how the variant ID
 and `<arch>` are chosen.
 
 The fetcher saves each browser download to a temporary file, inspects the ZIP
-contents when possible, combines that with Playwright's suggested filename, and
+contents when possible, combines that with the browser's suggested filename, and
 then renames the file to one of the known Android package extensions:
 
 - `.apk`: single Android package.
@@ -204,35 +213,83 @@ then renames the file to one of the known Android package extensions:
 - `.apks`: generic split-APK archive.
 - `.aab`: Android App Bundle.
 
-Unknown files are saved with `.download` rather than being mislabeled as APKs.
-Those files also satisfy future skip checks for the same variant.
+Anything that is not a complete Android package, such as a challenge page or a
+transfer that was cut off, is refused: the variant is recorded as failed,
+nothing is saved, and any earlier file for that variant is kept.
 
 Skip checks are per variant: each run still opens the source's version page to
 see which variants exist, then downloads only those without a
-`<app>-<version>-<source>-<variant-id>-*` file (any package extension or
-`.download`). A source counts as successful when at least one of its variants
-was downloaded or already present, so default fallback mode stops there, while
-`--all-sources` continues to every configured source. If some variants fail,
-the rest are still downloaded and the failures are logged by variant ID.
+`<app>-<version>-<source>-<variant-id>-*` file (any package extension). Empty
+files and files that are not packages do not count. A source counts as
+successful when at least one of its variants was downloaded or already present,
+so default fallback mode stops there, while `--all-sources` continues to every
+configured source. If some variants fail, the rest are still downloaded, the
+failures are logged by variant ID, and the run exits non-zero.
 
 Files saved before variant support (`<app>-<version>-<source>.<type>`) are left
 alone and do not count as any variant, so those variants are downloaded again
 under their new names.
 
 If a source's version page cannot be read (for example a Cloudflare challenge)
-but files for that version from that source are already on disk, including
+but packages for that version from that source are already on disk, including
 pre-variant names, the run keeps them, logs a warning, and treats the source as
 successful instead of falling back to the next source. `--force` turns this
 off.
 
 Use `--force` to re-download variants even when matching files already exist;
-the variant's previous file is replaced.
+the variant's previous file is replaced once the new download has passed the
+package checks.
+
+## Choosing Platforms
+
+`--platform` keeps only packages that support every platform listed:
+
+```bash
+./run.sh --version 13.2.0 --platform x86
+./run.sh --version 13.2.0 --platform arm64,x86
+```
+
+The names are `arm` (32-bit `armeabi-v7a`), `arm64` (`arm64-v8a`), `x86`
+(32-bit) and `x86_64`. A package with no native code runs anywhere, so it always
+qualifies. To collect separate builds for each platform, run once per platform.
+
+A variant whose listing names other platforms is skipped without downloading it.
+When the listing does not say, as on Uptodown, the file is downloaded, inspected
+and discarded if it does not qualify, so such a variant is downloaded again on
+every run. If no variant on a source qualifies, the next source is tried.
+
+## Checking for a Newer Version
+
+`--check` compares a version with what the sources currently list and downloads
+nothing:
+
+```bash
+./run.sh --check 13.2.0
+./run.sh --check 13.2.0 --source apkmirror
+```
+
+Every configured source is read unless `--source` is given. Betas and other
+versions that are not plain numbers are ignored. `--app` is required when the
+config has more than one app.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Every source was read and none lists anything newer. |
+| `1` | A source could not be read and nothing newer was found on the others. |
+| `2` | The command line was invalid. |
+| `3` | A newer version is listed. |
 
 ## Browser Selection
 
-By default, Playwright launches its managed Chromium. If
-`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` is set, `BaseScraper` passes it to
-Playwright as `executable_path`.
+The browser is driven by Patchright, a Playwright fork with the same API that
+shows fewer signs of automation. By default it launches its managed Chromium.
+If `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` is set, `BaseScraper` passes it to
+Patchright as `executable_path`.
+
+Every run uses the same Chrome profile in `browser-profile/`, so cookies from a
+completed bot check carry over for as long as the site allows. The folder holds
+site cookies and is ignored by git. Delete it to start fresh. Only one run can
+use the profile at a time.
 
 Examples:
 
@@ -246,7 +303,7 @@ variable is not already set.
 
 ## Troubleshooting
 
-### `ModuleNotFoundError: No module named 'playwright'`
+### `ModuleNotFoundError: No module named 'patchright'`
 
 Install dependencies in the virtual environment and use that interpreter:
 
@@ -256,12 +313,12 @@ pip install -r requirements.txt
 ./venv/bin/python main.py --help
 ```
 
-### Playwright cannot find a browser
+### Patchright cannot find a browser
 
-Install Playwright Chromium:
+Install Patchright Chromium:
 
 ```bash
-playwright install chromium
+patchright install chromium
 ```
 
 Or set a system browser path:
@@ -281,6 +338,14 @@ Run with a visible browser and debug logging:
 If the source website changed its markup or inserted an interstitial page, the
 corresponding scraper module may need selector updates.
 
+### A source blocks the request
+
+A run that logs `Blocked by <source>` reached the site, which refused it or
+answered with a bot check. Keep `headless: false` in `config.yaml`, as shipped,
+or pass `--no-headless`, and complete the check in the browser window when it
+appears. The scraper waits up to three minutes for each check. Uptodown shows
+its check after the download button is clicked.
+
 ### Telling variants apart
 
 Every variant a source lists is saved as
@@ -290,12 +355,11 @@ Every variant a source lists is saved as
 ID (see each source above). `<arch>` comes from scanning the downloaded file:
 `universal` when it has no native code or ships all of `arm64-v8a`,
 `armeabi-v7a`, `x86` and `x86_64`; otherwise the ABIs it contains joined with
-`+` (e.g. `arm64-v8a+armeabi-v7a`); `unknown` when the file is not a recognised
-package.
+`+` (e.g. `arm64-v8a+armeabi-v7a`).
 
 ### Bulk mode skips variants
 
-A variant is skipped when a file with its
+A variant is skipped when a package with its
 `<app>-<version>-<source>-<variant-id>-` prefix already exists. Pass `--force`,
 delete that file, or use a different `--output` directory to retry. Bulk reruns
 still load every version page, because a source may have added variants since
@@ -331,12 +395,14 @@ apps:
 1. Create `src/<source>.py`.
 2. Subclass `BaseScraper`.
 3. Set `SOURCE_NAME` to the source slug used in filenames.
-4. Implement `_app_name(config)`, `_list_variants(page, config, version)`
+4. Implement `_app_name(config)`, `_list_versions(page, config)` (the version
+   numbers the site lists, in any order), `_list_variants(page, config, version)`
    (returning `VariantRef`s with the site's own stable variant ID) and
    `_download_variant(page, app_name, version, variant)`. `BaseScraper.scrape`
-   handles the browser, skip checks and per-variant failures.
-5. Raise `VersionNotFoundError`, `DownloadError`, or `ScraperError` for
-   expected failures.
+   handles the browser, skip checks, platform filtering and per-variant failures.
+5. Navigate with `self._open(page, url)`, which reports refusals and bot checks
+   as `SourceBlockedError`. Raise `VersionNotFoundError`, `DownloadError`, or
+   `ScraperError` for other expected failures.
 6. Export the scraper in `src/__init__.py`.
 7. Add it to the `SCRAPERS` registry and `SOURCE_PRIORITY` in `main.py`.
 8. Document its config keys in the README and this guide.

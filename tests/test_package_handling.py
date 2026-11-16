@@ -3,10 +3,13 @@ import tempfile
 import unittest
 import zipfile
 
-from src.base import BaseScraper
+from src.base import BaseScraper, DownloadError
 
 
 class ProbeScraper(BaseScraper):
+    def _list_versions(self, page, config):
+        return []
+
     def _app_name(self, config):
         return "probe"
 
@@ -90,16 +93,14 @@ class PackageDetectionTests(unittest.TestCase):
                 ("aab", ".aab"),
             )
 
-    def test_unknown_file_uses_download_extension(self):
+    def test_unknown_content_is_refused_even_with_a_package_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "unknown.bin")
             with open(path, "wb") as f:
                 f.write(b"not a zip")
 
-            self.assertEqual(
-                self.scraper._identify_package_file(path),
-                ("unknown", ".download"),
-            )
+            with self.assertRaises(DownloadError):
+                self.scraper._identify_package_file(path, "telegram.apk")
 
 
 if __name__ == "__main__":

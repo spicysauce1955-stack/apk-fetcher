@@ -18,6 +18,9 @@ from src.base import (
 class ProbeScraper(BaseScraper):
     SOURCE_NAME = "probe"
 
+    def _list_versions(self, page, config):
+        return []
+
     def _app_name(self, config):
         return "probe"
 
@@ -35,10 +38,9 @@ def _write_zip(path, entries):
     return path
 
 
-def _touch(path):
-    with open(path, "wb") as f:
-        f.write(b"x")
-    return path
+def _package(path):
+    """Write a minimal real package, which is what skip checks look for."""
+    return _write_zip(path, {"AndroidManifest.xml": b"manifest"})
 
 
 class ArchLabelTests(unittest.TestCase):
@@ -79,7 +81,7 @@ class FindExistingVariantTests(unittest.TestCase):
         os.makedirs(self.app_dir)
 
     def _file(self, name):
-        return _touch(os.path.join(self.app_dir, name))
+        return _package(os.path.join(self.app_dir, name))
 
     def _find(self, source, variant_id):
         return find_existing_variant(
@@ -90,9 +92,22 @@ class FindExistingVariantTests(unittest.TestCase):
         expected = self._file("telegram-13.0.3-apkmirror-2-universal.apkm")
         self.assertEqual(self._find("apkmirror", "2"), expected)
 
-    def test_matches_download_extension(self):
-        expected = self._file("telegram-13.0.3-apkpure-70242-unknown.download")
-        self.assertEqual(self._find("apkpure", "70242"), expected)
+    def test_empty_file_is_not_a_saved_variant(self):
+        open(os.path.join(self.app_dir,
+                          "telegram-13.0.3-apkmirror-2-universal.apk"), "wb").close()
+
+        self.assertIsNone(self._find("apkmirror", "2"))
+
+    def test_non_package_file_is_not_a_saved_variant(self):
+        for name in ("telegram-13.0.3-apkpure-70242-unknown.apk",
+                     "telegram-13.0.3-apkpure-70242-unknown.download"):
+            with self.subTest(name):
+                path = os.path.join(self.app_dir, name)
+                with open(path, "wb") as f:
+                    f.write(b"<html>Just a moment...</html>")
+                self.addCleanup(os.remove, path)
+
+                self.assertIsNone(self._find("apkpure", "70242"))
 
     def test_id_is_not_a_prefix_match(self):
         self._file("telegram-13.0.3-apkmirror-12-universal.apk")
@@ -162,8 +177,8 @@ class FinalizeVariantTests(unittest.TestCase):
         )
 
     def test_force_replaces_same_variant_with_new_arch_label(self):
-        _touch(os.path.join(self.app_dir, "telegram-13.0.3-probe-7-unknown.download"))
-        neighbor = _touch(
+        _package(os.path.join(self.app_dir, "telegram-13.0.3-probe-7-arm64-v8a.apk"))
+        neighbor = _package(
             os.path.join(self.app_dir, "telegram-13.0.3-probe-70-universal.apk")
         )
         temp_path = self._temp({"AndroidManifest.xml": b"manifest"})
@@ -193,6 +208,9 @@ class FakeScraper(BaseScraper):
 
     def _close_browser(self, playwright, browser):
         pass
+
+    def _list_versions(self, page, config):
+        return []
 
     def _app_name(self, config):
         return "app"
@@ -235,7 +253,27 @@ class ScrapeLoopTests(unittest.TestCase):
     def _saved(self, filename):
         app_dir = os.path.join(self.output_dir, "app")
         os.makedirs(app_dir, exist_ok=True)
-        return _touch(os.path.join(app_dir, filename))
+        return _package(os.path.join(app_dir, filename))
+
+    def _saved_empty(self, filename):
+        app_dir = os.path.join(self.output_dir, "app")
+        os.makedirs(app_dir, exist_ok=True)
+        open(os.path.join(app_dir, filename), "wb").close()
+
+    def test_listing_failure_does_not_count_an_empty_file(self):
+        self._saved_empty("app-13.0.3-fake.apkm")
+        scraper = self._scraper([], list_error=DownloadError("blocked"))
+
+        with self.assertRaises(DownloadError):
+            scraper.scrape({}, "13.0.3")
+
+    def test_empty_variant_file_is_downloaded_again(self):
+        self._saved_empty("app-13.0.3-fake-1-universal.apk")
+        scraper = self._scraper(["1"])
+
+        scraper.scrape({}, "13.0.3")
+
+        self.assertEqual(scraper.download_calls, ["1"])
 
     def test_listing_failure_keeps_files_already_on_disk(self):
         existing = sorted([self._existing("1"), self._existing("2")])

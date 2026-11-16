@@ -1,11 +1,19 @@
+import json
 import logging
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import main
-from src.base import APKInfo, DownloadError, ScrapeResult
+from src.base import (
+    APKInfo,
+    DownloadError,
+    ScrapeResult,
+    SourceBlockedError,
+    VersionNotFoundError,
+)
 from src.config import AppConfig
 
 
@@ -13,7 +21,7 @@ def _fake_scraper(name, calls, outcome):
     """Build a scraper class that records scrape calls and returns outcome."""
 
     class FakeScraper:
-        def __init__(self, output_dir, headless):
+        def __init__(self, output_dir, headless, platforms=()):
             pass
 
         def scrape(self, config, version, force=False):
@@ -36,6 +44,12 @@ def _downloaded():
         architectures=["universal"],
         variant_id="1",
     )])
+
+
+def _partial():
+    result = _downloaded()
+    result.failed.append(("2", "timeout"))
+    return result
 
 
 class FetchApkTests(unittest.TestCase):
@@ -65,27 +79,27 @@ class FetchApkTests(unittest.TestCase):
         return [name for name, _version, _force in self.calls]
 
     def test_fallback_stops_at_first_success(self):
-        ok = self._fetch(_downloaded(), _downloaded())
+        status = self._fetch(_downloaded(), _downloaded())
 
-        self.assertTrue(ok)
+        self.assertEqual(status, main.FetchStatus.COMPLETE)
         self.assertEqual(self._sources_called(), ["apkmirror"])
 
     def test_existing_only_counts_as_success(self):
-        ok = self._fetch(ScrapeResult(existing=["p"]), _downloaded())
+        status = self._fetch(ScrapeResult(existing=["p"]), _downloaded())
 
-        self.assertTrue(ok)
+        self.assertEqual(status, main.FetchStatus.COMPLETE)
         self.assertEqual(self._sources_called(), ["apkmirror"])
 
     def test_falls_through_on_error(self):
-        ok = self._fetch(DownloadError("boom"), _downloaded())
+        status = self._fetch(DownloadError("boom"), _downloaded())
 
-        self.assertTrue(ok)
+        self.assertEqual(status, main.FetchStatus.COMPLETE)
         self.assertEqual(self._sources_called(), ["apkmirror", "uptodown"])
 
     def test_all_sources_tries_every_source(self):
-        ok = self._fetch(_downloaded(), _downloaded(), all_sources=True)
+        status = self._fetch(_downloaded(), _downloaded(), all_sources=True)
 
-        self.assertTrue(ok)
+        self.assertEqual(status, main.FetchStatus.COMPLETE)
         self.assertEqual(self._sources_called(), ["apkmirror", "uptodown"])
 
     def test_force_is_passed_through(self):
@@ -101,6 +115,95 @@ class FetchApkTests(unittest.TestCase):
         self._fetch(_downloaded(), _downloaded())
 
         self.assertEqual(self._sources_called(), ["apkmirror"])
+
+    def test_failed_variant_makes_the_result_partial(self):
+        status = self._fetch(_partial(), _downloaded())
+
+        self.assertEqual(status, main.FetchStatus.PARTIAL)
+        self.assertEqual(self._sources_called(), ["apkmirror"])
+
+    def test_every_source_failing_is_failed(self):
+        status = self._fetch(DownloadError("boom"), VersionNotFoundError("no"))
+
+        self.assertEqual(status, main.FetchStatus.FAILED)
+
+    def test_all_sources_with_a_failing_source_is_partial(self):
+        for error in (DownloadError("boom"), SourceBlockedError("403")):
+            with self.subTest(type(error).__name__):
+                status = self._fetch(error, _downloaded(), all_sources=True)
+
+                self.assertEqual(status, main.FetchStatus.PARTIAL)
+
+    def test_all_sources_with_a_version_one_source_lacks_is_complete(self):
+        status = self._fetch(VersionNotFoundError("no"), _downloaded(),
+                             all_sources=True)
+
+        self.assertEqual(status, main.FetchStatus.COMPLETE)
+
+    def test_blocked_source_falls_through_and_is_logged_as_blocked(self):
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs("fetcher", level="WARNING") as logs:
+            self._fetch(SourceBlockedError("HTTP 403"), _downloaded())
+
+        self.assertEqual(self._sources_called(), ["apkmirror", "uptodown"])
+        self.assertIn("blocked", logs.output[0].lower())
+        self.assertNotIn("not found", logs.output[0].lower())
+
+
+class ExitCodeTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.config = os.path.join(tmp.name, "config.yaml")
+        with open(self.config, "w") as f:
+            f.write(
+                f"output_dir: {tmp.name}\n"
+                "apps:\n"
+                "  telegram:\n"
+                '    versions: ["13.0.3"]\n'
+                "    sources:\n"
+                "      apkmirror: {k: 1}\n"
+            )
+        self.versions = os.path.join(tmp.name, "versions.json")
+        with open(self.versions, "w") as f:
+            json.dump([{"version": "13.0.3"}], f)
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def _run(self, outcome, *args):
+        scrapers = {"apkmirror": _fake_scraper("apkmirror", [], outcome)}
+        argv = ["main.py", "--config", self.config, "--app", "telegram", *args]
+        with mock.patch.dict(main.SCRAPERS, scrapers, clear=True):
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(main, "setup_logging"):
+                    with self.assertRaises(SystemExit) as caught:
+                        main.main()
+        return caught.exception.code
+
+    def test_complete_run_exits_zero(self):
+        self.assertEqual(self._run(_downloaded()), 0)
+
+    def test_partial_run_exits_non_zero(self):
+        self.assertEqual(self._run(_partial()), 1)
+
+    def test_failed_run_exits_non_zero(self):
+        self.assertEqual(self._run(DownloadError("boom")), 1)
+
+    def test_partial_bulk_run_exits_non_zero(self):
+        self.assertEqual(self._run(_partial(), "--bulk", self.versions), 1)
+
+    def test_complete_bulk_run_exits_zero(self):
+        self.assertEqual(self._run(_downloaded(), "--bulk", self.versions), 0)
+
+    def test_summary_counts_partial_versions(self):
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs("fetcher", level="WARNING"):
+            with self.assertLogs("main", level="INFO") as logs:
+                self._run(_partial())
+
+        self.assertTrue(any("1 partial" in line for line in logs.output))
 
 
 if __name__ == "__main__":

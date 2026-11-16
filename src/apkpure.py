@@ -13,6 +13,8 @@ from .base import (
     VariantRef,
     VersionNotFoundError,
     DownloadError,
+    PlatformMismatchError,
+    last_word,
 )
 
 
@@ -71,6 +73,14 @@ def parse_apkpure_variants(html: str, package: str,
             add(link["href"], link.get_text(" ", strip=True))
 
     return variants
+
+
+def parse_apkpure_versions(html: str, package: str) -> List[str]:
+    """Read version names from an APKPure versions page, skipping other apps."""
+    soup = BeautifulSoup(html, "lxml")
+    return [last_word(link.get_text(" ", strip=True))
+            for link in soup.select("a.ver-item-n[href]")
+            if f"/{package}/" in link["href"]]
 
 
 class APKPureScraper(BaseScraper):
@@ -133,6 +143,16 @@ class APKPureScraper(BaseScraper):
         app_slug = config.get("app_slug", package)
         return app_slug.split("/")[-1] if "/" in app_slug else app_slug
 
+    def _versions_url(self, config: dict) -> str:
+        package = config["package"]
+        app_slug = config.get("app_slug", package)
+        return f"{self.BASE_URL}/{app_slug}/{package}/versions"
+
+    def _list_versions(self, page, config: dict) -> List[str]:
+        self._open(page, self._versions_url(config))
+        self._wait(5)
+        return parse_apkpure_versions(page.content(), config["package"])
+
     def _list_variants(self, page, config: dict,
                        version: str) -> List[VariantRef]:
         """
@@ -143,28 +163,22 @@ class APKPureScraper(BaseScraper):
             - app_slug: Optional app slug for URL (e.g., "telegram")
         """
         package = config["package"]
-        app_slug = config.get("app_slug", package)
-        
-        # APKPure URL format: /app-name/package-name/versions
-        versions_url = f"{self.BASE_URL}/{app_slug}/{package}/versions"
-        
+        versions_url = self._versions_url(config)
+
         self.logger.info(f"Fetching {package} v{version} from APKPure")
         
         # Step 1: Load versions page
         self.logger.info(f"Loading versions page: {versions_url}")
-        page.goto(versions_url, wait_until="domcontentloaded", timeout=30000)
+        self._open(page, versions_url)
         self._wait(5)
-        
+
         self.logger.debug(f"Page title: {page.title()}")
-        content = page.content()
-        
+
         # Step 2: Find the target version
         self.logger.info("Searching for version links...")
         version_link = self._find_version_link(page, version)
-        
+
         if not version_link:
-            if "cloudflare" in content.lower() or "verify you are human" in content.lower():
-                self.logger.error("Blocked by Cloudflare on APKPure")
             raise VersionNotFoundError(f"Version {version} not found on APKPure")
 
         self.logger.info("Found version link")
@@ -173,7 +187,7 @@ class APKPureScraper(BaseScraper):
         if not version_link.startswith("http"):
             version_link = self.BASE_URL + version_link
         
-        page.goto(version_link, wait_until="domcontentloaded", timeout=30000)
+        self._open(page, version_link)
         self._wait(2)
         
         variants = parse_apkpure_variants(page.content(), package, version)
@@ -194,5 +208,7 @@ class APKPureScraper(BaseScraper):
                 variant.variant_id,
                 referer=page.url,
             )
+        except PlatformMismatchError:
+            raise
         except Exception as e:
             raise DownloadError(f"Direct package download failed: {e}") from e
